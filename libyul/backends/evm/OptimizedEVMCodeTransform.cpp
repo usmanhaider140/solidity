@@ -490,14 +490,7 @@ void OptimizedEVMCodeTransform::operator()(CFG::BasicBlock const& _block)
 			createStackLayout(debugDataOf(_functionReturn), exitStack);
 			m_assembly.appendJump(0, AbstractAssembly::JumpType::OutOfFunction);
 		},
-		[&](CFG::BasicBlock::Terminated const&)
-		{
-			// Assert that the last builtin call was in fact terminating.
-			yulAssert(!_block.operations.empty(), "");
-			CFG::BuiltinCall const* builtinCall = get_if<CFG::BuiltinCall>(&_block.operations.back().operation);
-			yulAssert(builtinCall, "");
-			yulAssert(builtinCall->builtin.get().controlFlowSideEffects.terminatesOrReverts(), "");
-		}
+		[&](CFG::BasicBlock::Terminated const&) { }
 	}, _block.exit);
 	// TODO: We could assert that the last emitted assembly item terminated or was an (unconditional) jump.
 	//       But currently AbstractAssembly does not allow peeking at the last emitted assembly item.

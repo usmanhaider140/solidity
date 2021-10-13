@@ -210,6 +210,7 @@ struct CFG
 	{
 		std::shared_ptr<DebugData const> debugData;
 		Scope::Function const& function;
+		FunctionDefinition const& functionDefinition;
 		BasicBlock* entry = nullptr;
 		std::vector<VariableSlot> parameters;
 		std::vector<VariableSlot> returnVariables;
