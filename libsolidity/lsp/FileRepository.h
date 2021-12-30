@@ -29,7 +29,10 @@ class FileRepository
 {
 public:
 	explicit FileRepository(boost::filesystem::path const& _basePath):
-		m_fileReader(_basePath) {}
+		m_fileReader(_basePath)
+	{
+		m_fileReader.allowDirectory(boost::filesystem::path("/"));
+	}
 
 	boost::filesystem::path const& basePath() const { return m_fileReader.basePath(); }
 

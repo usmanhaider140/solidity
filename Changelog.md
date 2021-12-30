@@ -6,6 +6,7 @@ Language Features:
 Compiler Features:
  * Peephole Optimizer: Remove operations without side effects before simple terminations.
  * Assembly-Json: Export: Include source list in `sourceList` field.
+ * Language Server: Allow full filesystem access to language server.
 
 
 Bugfixes:
