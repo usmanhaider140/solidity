@@ -27,6 +27,7 @@
 #include <libyul/optimiser/SSAValueTracker.h>
 #include <libyul/optimiser/Semantics.h>
 #include <libyul/optimiser/CallGraphGenerator.h>
+#include <libyul/backends/evm/EVMDialect.h>
 #include <libyul/Exceptions.h>
 #include <libyul/AST.h>
 #include <libyul/Dialect.h>
@@ -177,8 +178,16 @@ bool FullInliner::shallInline(FunctionCall const& _funCall, YulString _callSite)
 	if (m_pass == Pass::InlineTiny)
 		return false;
 
+	bool usesNewCodeTransform = true;
+
+	if (
+		EVMDialect const* evmDialect = dynamic_cast<EVMDialect const*>(&m_dialect);
+		!evmDialect || !evmDialect->providesObjectAccess() || evmDialect->evmVersion() <= langutil::EVMVersion::homestead()
+	)
+		usesNewCodeTransform = false;
+
 	// Do not inline into already big functions.
-	if (m_functionSizes.at(_callSite) > 45)
+	if (m_functionSizes.at(_callSite) > (usesNewCodeTransform ? 450 : 45))
 		return false;
 
 	if (m_singleUse.count(calledFunction->name))
@@ -196,7 +205,7 @@ bool FullInliner::shallInline(FunctionCall const& _funCall, YulString _callSite)
 			break;
 		}
 
-	return (size < 6 || (constantArg && size < 12));
+	return (size < (usesNewCodeTransform ? 8 : 6) || (constantArg && size < (usesNewCodeTransform ? 16 : 12)));
 }
 
 void FullInliner::tentativelyUpdateCodeSize(YulString _function, YulString _callSite)
