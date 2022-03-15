@@ -504,7 +504,8 @@ void ControlFlowGraphBuilder::registerFunction(FunctionDefinition const& _functi
 				_retVar.debugData
 			};
 		}) | ranges::to<vector>,
-		{}
+		{},
+		m_functionSideEffects.at(&_function).canContinue
 	})).second;
 	yulAssert(inserted);
 }
@@ -538,7 +539,10 @@ Stack const& ControlFlowGraphBuilder::visitFunctionCall(FunctionCall const& _cal
 	else
 	{
 		Scope::Function const& function = lookupFunction(_call.functionName.name);
-		Stack inputs{FunctionCallReturnLabelSlot{_call}};
+		canContinue = m_graph.functionInfo.at(&function).canContinue;
+		Stack inputs;
+		if (canContinue)
+			inputs.emplace_back(FunctionCallReturnLabelSlot{_call});
 		for (auto const& arg: _call.arguments | ranges::views::reverse)
 			inputs.emplace_back(std::visit(*this, arg));
 		output = &m_currentBlock->operations.emplace_back(CFG::Operation{
@@ -549,11 +553,8 @@ Stack const& ControlFlowGraphBuilder::visitFunctionCall(FunctionCall const& _cal
 				return TemporarySlot{_call, _i};
 			}) | ranges::to<Stack>,
 			// operation
-			CFG::FunctionCall{_call.debugData, function, _call}
+			CFG::FunctionCall{_call.debugData, function, _call, false, canContinue}
 		}).output;
-		canContinue = m_functionSideEffects.at(
-			&m_graph.functionInfo.at(&function).functionDefinition
-		).canContinue;
 	}
 	if (!canContinue)
 	{

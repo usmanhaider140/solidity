@@ -148,6 +148,8 @@ struct CFG
 		/// True, if the call is recursive, i.e. entering the function involves a control flow path (potentially involving
 		/// more intermediate function calls) that leads back to this very call.
 		bool recursive = false;
+		/// True, if the call can return.
+		bool canContinue = true;
 	};
 	struct Assignment
 	{
@@ -215,6 +217,7 @@ struct CFG
 		std::vector<VariableSlot> parameters;
 		std::vector<VariableSlot> returnVariables;
 		std::vector<BasicBlock*> exits;
+		bool canContinue = true;
 	};
 
 	/// The main entry point, i.e. the start of the outermost Yul block.
