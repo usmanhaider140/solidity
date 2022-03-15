@@ -25,7 +25,7 @@ contract c {
 // compileViaYul: also
 // ----
 // test() -> 1, 2, 3
-// gas irOptimized: 2271044
+// gas irOptimized: 2270651
 // gas legacy: 2273434
 // gas legacyOptimized: 2261820
 // storageEmpty -> 1

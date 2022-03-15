@@ -28,7 +28,7 @@
 // Block0 [label="\
 // i: [ RET[i] ] => [ TMP[i, 0] TMP[i, 1] ]\l\
 // Assignment(x, y): [ TMP[i, 0] TMP[i, 1] ] => [ x y ]\l\
-// h: [ RET[h] x ] => [ ]\l\
+// h: [ x ] => [ ]\l\
 // "];
 // Block0Exit [label="Terminated"];
 // Block0 -> Block0Exit;
@@ -56,7 +56,7 @@
 // FunctionEntry_h_3 -> Block3;
 // Block3 [label="\
 // f: [ RET[f] 0x00 x ] => [ TMP[f, 0] ]\l\
-// h: [ RET[h] TMP[f, 0] ] => [ ]\l\
+// h: [ TMP[f, 0] ] => [ ]\l\
 // "];
 // Block3Exit [label="Terminated"];
 // Block3 -> Block3Exit;

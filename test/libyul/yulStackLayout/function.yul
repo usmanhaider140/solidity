@@ -27,13 +27,13 @@
 // Entry -> Block0;
 // Block0 [label="\
 // [ ]\l\
-// [ RET[h] RET[i] ]\l\
+// [ RET[i] ]\l\
 // i\l\
-// [ RET[h] TMP[i, 0] TMP[i, 1] ]\l\
-// [ RET[h] TMP[i, 0] TMP[i, 1] ]\l\
+// [ TMP[i, 0] TMP[i, 1] ]\l\
+// [ TMP[i, 0] TMP[i, 1] ]\l\
 // Assignment(x, y)\l\
-// [ RET[h] x y ]\l\
-// [ RET[h] x ]\l\
+// [ x y ]\l\
+// [ x ]\l\
 // h\l\
 // [ ]\l\
 // [ ]\l\
@@ -80,11 +80,11 @@
 // [ RET x ]"];
 // FunctionEntry_h -> Block3;
 // Block3 [label="\
-// [ RET[h] RET[f] 0x00 x ]\l\
-// [ RET[h] RET[f] 0x00 x ]\l\
+// [ RET[f] 0x00 x ]\l\
+// [ RET[f] 0x00 x ]\l\
 // f\l\
-// [ RET[h] TMP[f, 0] ]\l\
-// [ RET[h] TMP[f, 0] ]\l\
+// [ TMP[f, 0] ]\l\
+// [ TMP[f, 0] ]\l\
 // h\l\
 // [ ]\l\
 // [ ]\l\
