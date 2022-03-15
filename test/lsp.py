@@ -8,12 +8,75 @@ import subprocess
 import sys
 import traceback
 import re
-
+import tty
+import functools
+from collections import namedtuple
+import queue
+import threading
+from copy import deepcopy
 from typing import Any, List, Optional, Tuple, Union
 from enum import Enum, auto
+from itertools import islice
 
 import colorama # Enables the use of SGR & CUP terminal VT sequences on Windows.
 from deepdiff import DeepDiff
+
+TestRegexesTuple = namedtuple("TestRegexesTuple", [
+    "sendRequest",
+    "findQuotedTag",
+    "findTag",
+    "fileDiagnostics",
+    "diagnostic"
+])
+TEST_REGEXES = TestRegexesTuple(
+    re.compile(R'^// -> (?P<method>[\w\/]+) {'),
+    re.compile(R'(?P<tag>"@\w+")'),
+    re.compile(R'(?P<tag>@\w+)'),
+    re.compile(R'// (?P<testname>\w+):[ ]?(?P<diagnostics>[\w @]*)'),
+    re.compile(R'(?P<tag>@\w+) (?P<code>\d\d\d\d)')
+)
+
+TagRegexesTuple = namedtuple("TagRegexestuple", ["simpleRange", "multilineRange"])
+TAG_REGEXES = TagRegexesTuple(
+    re.compile(R"(?P<range>[\^]+) (?P<tag>@\w+)"),
+    re.compile(R"\^(?P<delimiter>[()]{1,2}) (?P<tag>@\w+)$")
+)
+
+
+def countIndex(sequence, start=0):
+    n = start
+    for elem in sequence:
+        yield n, elem
+        n += 1 + len(elem)
+
+# Filter the lines for tag comments and report line number that tags refer to
+def tagsOnly(lines, start=0):
+    n = start
+    numCommentLines = 0
+
+    def hasTag(line):
+        if line.find("// ") != -1:
+            for kind, regex in TAG_REGEXES._asdict().items():
+                if regex.search(line[len("// "):]) != None:
+                    return True
+        return False
+
+    for line in lines:
+        if hasTag(line):
+            numCommentLines += 1
+            yield n - numCommentLines, line
+        else:
+            numCommentLines = 0
+
+        n += 1
+
+
+def preceedComments(sequence):
+    result = ""
+    for line in sequence.splitlines(True):
+        result = result + "// " + line
+    return result
+
 
 # {{{ JsonRpcProcess
 class BadHeader(Exception):
@@ -26,11 +89,15 @@ class JsonRpcProcess:
     exe_args: List[str]
     process: subprocess.Popen
     trace_io: bool
+    messages: queue.Queue
+    last_message: None
 
     def __init__(self, exe_path: str, exe_args: List[str], trace_io: bool = True):
         self.exe_path = exe_path
         self.exe_args = exe_args
         self.trace_io = trace_io
+        self.messages = queue.Queue(10)
+        self.last_message = None
 
     def __enter__(self):
         self.process = subprocess.Popen(
@@ -39,7 +106,36 @@ class JsonRpcProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
+        self.async_read_loop()
         return self
+
+    # Reads a message without blocking
+    def read_message(self, peek=False, block=True):
+#        print("read_message(" + str(peek) + ", " + str(block))
+        timeout = 1 if block else 0
+
+        if peek:
+            if self.last_message == None:
+                self.last_message = self.messages.get(block, timeout)
+            return self.last_message
+
+        if self.last_message != None:
+            msg = self.last_message
+            self.last_message = None
+            return msg
+
+        return self.messages.get(block, timeout)
+
+    def async_read_loop(self):
+        def run_loop():
+            while True:
+                msg = self.receive_message()
+                if msg == None:
+                    break
+                self.messages.put(msg)
+
+        thread = threading.Thread(target=run_loop)
+        thread.start()
 
     def __exit__(self, exception_type, exception_value, traceback) -> None:
         self.process.kill()
@@ -59,7 +155,7 @@ class JsonRpcProcess:
         while True:
             # read header
             line = self.process.stdout.readline()
-            if line == '':
+            if len(line) == 0:
                 # server quit
                 return None
             line = line.decode("utf-8")
@@ -102,7 +198,7 @@ class JsonRpcProcess:
 
     def call_method(self, method_name: str, params: Optional[dict]) -> Any:
         self.send_message(method_name, params)
-        return self.receive_message()
+        return self.read_message(block=True)
 
     def send_notification(self, name: str, params: Optional[dict] = None) -> None:
         self.send_message(name, params)
@@ -118,6 +214,10 @@ SGR_STATUS_OKAY = '\033[1;32m'
 SGR_STATUS_FAIL = '\033[1;31m'
 
 class ExpectationFailed(Exception):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+class JSONExpectationFailed(ExpectationFailed):
     def __init__(self, actual, expected):
         self.actual = json.dumps(actual, sort_keys=True)
         self.expected = json.dumps(expected, sort_keys=True)
@@ -180,15 +280,146 @@ class Counter:
     failed: int = 0
 
 
-class Marker(Enum):
-    SimpleRange = auto()
-    MultilineRange = auto()
-
-
 # Returns the given marker with the end extended by 'amount'
 def extendEnd(marker, amount=1):
-    marker["end"]["character"] += amount
-    return marker
+    newMarker = deepcopy(marker)
+    newMarker["end"]["character"] += amount
+    return newMarker
+
+class ReplacingTag:
+    def __init__(self, tagName, tagRange):
+        self.tagName = tagName
+        self.tagRange = tagRange
+
+def encode_tags(z):
+    print("default!: " + str(z))
+    if isinstance(z, ReplacingTag):
+        return tagName
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+                    f'is not JSON serializable')
+
+class TestParserException(Exception):
+    def __init__(self, incompleteResult, msg: str):
+        self.result = incompleteResult
+        super().__init__("Failed to parse test specification: " + msg)
+
+class TestParser:
+    RequestAndResponse = namedtuple('RequestAndResponse',
+        "method, request, response, responseBegin, responseEnd",
+        defaults=(None, None, None, None)
+    )
+    Diagnostics = namedtuple('Diagnostics', 'tests start end')
+    Diagnostic = namedtuple('Diagnostic', 'marker code')
+
+    def __init__(self, content):
+        testDefStartIdx = content.find("// ----")
+
+        self.lines = islice(countIndex(content[testDefStartIdx:].splitlines(), testDefStartIdx), 1, None)
+        self.nextLine()
+
+    def parse(self):
+        yield self.parseDiagnostics()
+
+        while self.currentLine != None:
+            yield self.RequestAndResponse(**self.parseRequestAndResponse())
+            self.nextLine()
+
+
+    def parseDiagnostics(self):
+        diagnostics = { "tests": {} }
+
+        if self.currentLine != None:
+            diagnostics["start"] = self.position()
+
+        while self.currentLine != None:
+            print(self.currentLine)
+            fileDiagMatch = TEST_REGEXES.fileDiagnostics.match(self.line())
+            if fileDiagMatch == None:
+                diagnostics["end"] = self.position()
+                break
+
+            testDiagnostics = []
+
+            for diagnosticMatch in TEST_REGEXES.diagnostic.finditer(fileDiagMatch.group("diagnostics")):
+                testDiagnostics.append(self.Diagnostic(
+                    diagnosticMatch.group("tag"),
+                    int(diagnosticMatch.group("code"))
+                ))
+
+            diagnostics["tests"][fileDiagMatch.group("testname")] = testDiagnostics
+
+            self.nextLine()
+
+        return self.Diagnostics(**diagnostics)
+
+
+    def parseRequestAndResponse(self):
+        RESPONSE_START = "// <- {"
+        BLOCK_END = "// }"
+        COMMENT_PREFIX = "// "
+
+        ret = {}
+
+        # Parse request header
+        requestResult = TEST_REGEXES.sendRequest.match(self.line())
+        if requestResult != None:
+            ret["method"] = requestResult.group("method")
+            ret["request"] = "{\n"
+        else:
+            raise TestParserException(ret, "Method for request not found")
+
+        self.nextLine()
+
+        # Search for request block end
+        while self.currentLine != None:
+            line = self.line()
+            ret["request"] += line[len(COMMENT_PREFIX):] + "\n"
+
+            self.nextLine()
+
+            if line.startswith(BLOCK_END):
+                break
+
+            # Reached end without finding block_end. Abort.
+            if self.currentLine == None:
+                raise TestParserException(ret, "Request body not found")
+
+
+        # Parse response header
+        if self.line().startswith(RESPONSE_START):
+            ret["response"] = self.line()[len(RESPONSE_START)-1:] + "\n"
+            ret["responseBegin"] = self.position()
+        else:
+            raise TestParserException(ret, "Response header not found")
+
+        self.nextLine()
+
+        # Search for request block end
+        while self.currentLine != None:
+            ret["response"] += self.line()[len(COMMENT_PREFIX):] + "\n"
+
+            if self.line().startswith(BLOCK_END):
+                ret["responseEnd"] = self.position() + len(self.line())
+                break
+
+            self.nextLine()
+
+            # Reached end without finding block_end. Abort.
+            if self.currentLine == None:
+                raise TestParserException(ret, "Response footer not found")
+
+        return ret
+
+
+    def nextLine(self):
+        self.currentLine = next(self.lines, None)
+
+    def line(self):
+        return self.currentLine[1]
+
+    # Returns current byte position
+    def position(self):
+        return self.currentLine[0]
 
 
 class SolidityLSPTestSuite: # {{{
@@ -198,7 +429,6 @@ class SolidityLSPTestSuite: # {{{
     trace_io: bool = False
     fail_fast: bool = False
     test_pattern: str
-    marker_regexes: {}
 
     def __init__(self):
         colorama.init()
@@ -210,10 +440,6 @@ class SolidityLSPTestSuite: # {{{
         self.trace_io = args.trace_io
         self.test_pattern = args.test_pattern
         self.fail_fast = args.fail_fast
-        self.marker_regexes = {
-            Marker.SimpleRange: re.compile(R"(?P<range>[\^]+) (?P<tag>@\w+)"),
-            Marker.MultilineRange: re.compile(R"\^(?P<delimiter>[()]) (?P<tag>@\w+)$")
-        }
 
         print(f"{SGR_NOTICE}test pattern: {self.test_pattern}{SGR_RESET}")
 
@@ -322,16 +548,65 @@ class SolidityLSPTestSuite: # {{{
         Return `count` number of published diagnostic reports sorted by file URI.
         """
         reports = []
-        for _ in range(0, count):
-            message = solc.receive_message()
+
+#        import pdb; pdb.set_trace()
+        for num in range(0, count):
+            try:
+                message = solc.read_message(peek=True, block=True)
+            except:
+                break
+
             assert message is not None # This can happen if the server aborts early.
-            reports.append(
-                self.require_params_for_method(
-                    'textDocument/publishDiagnostics',
-                    message,
+
+            if "method" in message and message["method"] == "textDocument/publishDiagnostics":
+                reports.append(
+                    self.require_params_for_method(
+                        'textDocument/publishDiagnostics',
+                        message,
+                    )
                 )
-            )
+                solc.read_message(peek=False) # remove peeked message
+            else:
+                break
+
         return sorted(reports, key=lambda x: x['uri'])
+
+    def fetch_and_format_diagnostics(self, solc: JsonRpcProcess, test):
+        expectations = ""
+
+        published_diagnostics = self.open_file_and_wait_for_diagnostics(solc, test, 100)
+
+        for diagnostics in published_diagnostics:
+            testname = diagnostics["uri"].replace(self.project_root_uri + "/", "")[:-len(".sol")]
+
+            # Skip empty diagnostics within the same file
+            if len(diagnostics["diagnostics"]) == 0 and testname == test:
+                continue
+
+            expectations += f"// {testname}:"
+
+            for diagnostic in diagnostics["diagnostics"]:
+                tag = self.find_tag_with_range(testname, diagnostic['range'])
+
+                if tag == None:
+                    raise Exception(f"No tag found for diagnostic range {diagnostic['range']}")
+
+                expectations += f" {tag} {diagnostic['code']}"
+            expectations += "\n"
+
+        return expectations
+
+    def update_diagnostics_in_file(self, solc: JsonRpcProcess, test, content, diagStart, diagEnd):
+        new_diagnostics = self.fetch_and_format_diagnostics(solc, test)
+
+        content = content[:diagStart] + \
+            self.fetch_and_format_diagnostics(solc, test) + \
+            content[diagEnd:]
+
+        with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
+            f.write(content)
+
+        return content
 
     def open_file_and_wait_for_diagnostics(
         self,
@@ -370,7 +645,7 @@ class SolidityLSPTestSuite: # {{{
         # Failed assertions are always printed.
         self.assertion_counter.failed += 1
         print(prefix + SGR_STATUS_FAIL + 'FAILED' + SGR_RESET)
-        raise ExpectationFailed(actual, expected)
+        raise JSONExpectationFailed(actual, expected)
 
     def expect_empty_diagnostics(self, published_diagnostics: List[dict]) -> None:
         self.expect_equal(len(published_diagnostics), 1, "one publish diagnostics notification")
@@ -446,6 +721,87 @@ class SolidityLSPTestSuite: # {{{
         message = "Goto definition (" + description + ")"
         self.expect_equal(len(response['result']), 1, message)
         self.expect_location(response['result'][0], expected_uri, expected_lineNo, expected_startEndColumns)
+
+    def parse_json_with_tags(self, content, markersFallback):
+        splitted = TEST_REGEXES.findTag.split(content)
+
+        # add quotes so we can parse it as json
+        contentReplaced = '"'.join(splitted)
+        contentJson = json.loads(contentReplaced)
+
+        def replace_tag(data, markers):
+            # Check if we need markers from a specific file
+            if "uri" in data:
+                markers = self.get_file_tags(data["uri"][:-len(".sol")])
+
+            for key, val in data.items():
+                if key == "range":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange
+                elif key == "position":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange["start"]
+                elif isinstance(val, dict):
+                    replace_tag(val, markers)
+                elif isinstance(val, list):
+                    for el in val:
+                        replace_tag(el, markers)
+            return data
+
+        return replace_tag(contentJson, markersFallback)
+
+
+    def find_tag_with_range(self, test, range):
+        markers = self.get_file_tags(test)
+
+        for tag, tagRange in markers.items():
+            if tagRange == range:
+                return str(tag)
+
+        return None
+
+    def replace_ranges_with_tags(self, content):
+        # Replace matching ranges with "@<tagname>"
+        for result in content["result"]:
+            markers = self.get_file_tags(result["uri"][:-len(".sol")])
+            if "range" in result:
+                for tag, tagRange in markers.items():
+                    if tagRange == result["range"]:
+                        result["range"] = str(tag)
+
+        # Convert JSON to string and split it at the quoted tags
+        splitted = TEST_REGEXES.findQuotedTag.split(json.dumps(content, indent=4, sort_keys=True))
+
+        # remove the quotes and return result
+        return "".join(map(lambda p: p[1:-1] if p.startswith('"@') else p, splitted))
+
+    def userInteractionFailedDiagnostics(self, solc: JsonRpcProcess, test, content, start, end):
+        print("(u)pdate/(r)etry/(i)gnore?")
+        userResponse = sys.stdin.read(1)
+        if userResponse == "u":
+            while True:
+                try:
+                    content = self.update_diagnostics_in_file(solc, test, content, start, end)
+                    break
+                except Exception as e:
+                    print(e)
+                    print(self.get_file_tags(test))
+                    print("(e)dit/(r)etry/(i)gnore?")
+                    userResponse = sys.stdin.read(1)
+                    if userResponse == "e":
+                        subprocess.getstatusoutput(f'$EDITOR {self.get_test_file_path(test)}')
+                        pass
+                    elif userResponse == "r":
+                        print("retrying...")
+                        self.get_file_tags.cache_clear()
+                        break
+                    elif userResponse == "i":
+                        print("ignoring...")
+                        break
+
+
     # }}}
 
     # {{{ actual tests
@@ -527,6 +883,7 @@ class SolidityLSPTestSuite: # {{{
         self.expect_diagnostic(report['diagnostics'][0], code=2072, marker=marker)
 
 
+    @functools.lru_cache
     def get_file_tags(self, test_name: str, verbose=False):
         """
         Finds all tags (e.g. @tagname) in the given test and returns them as a
@@ -541,14 +898,12 @@ class SolidityLSPTestSuite: # {{{
 
         markers = {}
 
-        for lineNum, line in enumerate(content.splitlines(), start=-1):
+        for lineNum, line in tagsOnly(content.splitlines()):
             commentStart = line.find("//")
-            if commentStart == -1:
-                continue
 
-            for kind, regex in self.marker_regexes.items():
+            for kind, regex in TAG_REGEXES._asdict().items():
                 for match in regex.finditer(line[commentStart:]):
-                    if kind == Marker.SimpleRange:
+                    if kind == "simpleRange":
                         markers[match.group("tag")] = {
                             "start": {
                                 "line": lineNum,
@@ -558,7 +913,7 @@ class SolidityLSPTestSuite: # {{{
                                 "line": lineNum,
                                 "character": match.end("range") + commentStart
                         }}
-                    elif kind == Marker.MultilineRange:
+                    elif kind == "multilineRange":
                         if match.group("delimiter") == "(":
                             markers[match.group("tag")] = \
                                 { "start": { "line": lineNum, "character": 0 } }
@@ -632,8 +987,131 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(report['uri'], self.get_test_file_uri('lib'), "Correct file URI")
         self.expect_equal(len(report['diagnostics']), 1, "one diagnostic")
 
-        marker = self.get_file_tags('lib')["@diagnostics"]
+        markers = self.get_file_tags('lib')
+        marker = markers["@diagnostics"]
         self.expect_diagnostic(report['diagnostics'][0], code=2072, marker=marker)
+
+    def test_generic(self, solc: JsonRpcProcess) -> None:
+        self.setup_lsp(solc)
+        TESTS = ['goto_definition']
+
+        for test in TESTS:
+            content = None
+            markers = None
+
+            testFails = True
+            parsedTestcases = None
+            expectedDiagnostics = None
+
+            while testFails:
+                try:
+                    content = self.get_test_file_contents(test)
+                    markers = self.get_file_tags(test)
+                    parsedTestcases = TestParser(content).parse()
+
+                    # Process diagnostics first
+                    expectedDiagnostics = next(parsedTestcases)
+                    assert isinstance(expectedDiagnostics, TestParser.Diagnostics) is True
+
+                    tests = expectedDiagnostics.tests
+
+                    if test not in tests:
+                        tests[test] = []
+
+                    published_diagnostics = \
+                        self.open_file_and_wait_for_diagnostics(solc, test, len(tests))
+                    self.expect_equal(
+                        len(published_diagnostics),
+                        len(tests),
+                        "Amount of reports does not match!")
+
+                    for diagnostics in published_diagnostics:
+                        testname = diagnostics["uri"].replace(self.project_root_uri + "/", "")[:-len(".sol")]
+
+                        expected_diagnostics = tests[testname]
+                        self.expect_equal(
+                            len(diagnostics["diagnostics"]),
+                            len(expected_diagnostics),
+                            "Unexpected amount of diagnostics"
+                        )
+                        lMarkers = self.get_file_tags(testname)
+                        for diagnostic in diagnostics["diagnostics"]:
+                            expected_diagnostic = next((x for x in
+                                expected_diagnostics if diagnostic['range'] ==
+                                lMarkers[x.marker]), None)
+
+                            if expected_diagnostic == None:
+                                raise ExpectationFailed(f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
+
+                            #import pdb; pdb.set_trace()
+                            self.expect_diagnostic(
+                                diagnostic,
+                                code=expected_diagnostic.code,
+                                marker=lMarkers[expected_diagnostic.marker]
+                            )
+
+                        testFails = False
+                except ExpectationFailed as e:
+                    print(e)
+                    self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostic.start, expectedDiagnostic.end)
+                    continue
+
+                try:
+                    # Now handle each request/response pair in the test definition
+                    for testcase in parsedTestcases:
+
+                        requestBodyJson = self.parse_json_with_tags(testcase.request, markers)
+                        # add textDocument/uri if missing
+                        if 'textDocument' not in requestBodyJson:
+                            requestBodyJson['textDocument'] = { 'uri': self.get_test_file_uri(test) }
+                        actualResponseJson = solc.call_method(testcase.method, requestBodyJson)
+
+                        #print(actualResponseJson)
+                        if "method" in actualResponseJson and \
+                            actualResponseJson["method"] == "textDocument/publishDiagnostics":
+
+                            print("Received more diagnostics than expected: \n" +
+                                json.dumps(actualResponseJson["params"], indent=4, sort_keys=True))
+                            self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostic.start, expectedDiagnostic.end)
+                            break
+
+
+                        for result in actualResponseJson["result"]:
+                            result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
+
+                        try:
+                            expectedResponseJson = self.parse_json_with_tags(testcase.response, markers)
+                        except json.decoder.JSONDecodeError:
+                            expectedResponseJson = None
+
+
+                        if expectedResponseJson != actualResponseJson:
+                            print("Request failed: \n" + testcase.request)
+                            actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
+
+                            if expectedResponseJson == None:
+                                print("Failed to parse expected response, received: \n" + actualResponsePretty)
+                            else:
+                                print("Expected:\n" + \
+                                    self.replace_ranges_with_tags(expectedResponseJson) + \
+                                    "\nbut got:\n" + actualResponsePretty
+                                )
+                            print("(u)pdate/(r)etry/(i)gnore?")
+                            userResponse = sys.stdin.read(1)
+                            if userResponse == "u":
+                                content = content[:testcase.responseBegin] + \
+                                    preceedComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
+                                    content[testcase.responseEnd:]
+
+                                with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
+                                    f.write(content)
+                    else:
+                        continue
+                except TestParserException as e:
+                    print(e)
+                    print(e.result)
+
+
 
 
     def test_textDocument_didChange_updates_diagnostics(self, solc: JsonRpcProcess) -> None:
@@ -824,6 +1302,11 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(reports[0]['diagnostics']), 0, "should not contain diagnostics")
 
 
+    def findIndex(self, content, marker):
+        lineIndicies = [index for index in range(len(content)) if content.startswith('\n', index)]
+        return lineIndicies[marker["line"]] + marker["character"]
+
+
     def test_textDocument_didChange_at_eol(self, solc: JsonRpcProcess) -> None:
         """
         Append at one line and insert a new one below.
@@ -897,145 +1380,9 @@ class SolidityLSPTestSuite: # {{{
         })
         published_diagnostics = self.wait_for_diagnostics(solc, 2)
         self.expect_equal(len(published_diagnostics), 2, "publish diagnostics for 2 files")
-        self.expect_equal(len(published_diagnostics[0]['diagnostics']), 0)
+        self.expect_equal(len(published_diagnostics[0]['diagnostics']), 1)
         self.expect_equal(len(published_diagnostics[1]['diagnostics']), 1)
-        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 33, (8, 19)) # unused variable in lib.sol
-
-        # import directive
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(3, 9), # symbol `"./lib.sol"` in `import "./lib.sol"`
-            expected_uri=LIB_URI,
-            expected_lineNo=0,
-            expected_startEndColumns=(0, 0),
-            description="import directive"
-        )
-
-        # type symbol to jump to type defs (error, contract, enum, ...)
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(30, 19), # symbol `IA` in `new IA()`
-            expected_uri=FILE_URI,
-            expected_lineNo=10,
-            expected_startEndColumns=(9, 11),
-            description="type symbol to jump to definition"
-        )
-
-        # virtual function lookup?
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(31, 12), # symbol `f`, jumps to interface definition
-            expected_uri=FILE_URI,
-            expected_lineNo=7,
-            expected_startEndColumns=(13, 14),
-            description="virtual function lookup"
-        )
-
-        # using for
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(37, 10), # symbol `add` in `i.add(5)`
-            expected_uri=FILE_URI,
-            expected_lineNo=22,
-            expected_startEndColumns=(13, 16),
-            description="using for"
-        )
-
-        # library
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(43, 15), # symbol `Lib` in `Lib.add(n, 1)`
-            expected_uri=LIB_URI,
-            expected_lineNo=22,
-            expected_startEndColumns=(8, 11),
-            description="Library symbol from different file"
-        )
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(43, 19), # symbol `add` in `Lib.add(n, 1)`
-            expected_uri=LIB_URI,
-            expected_lineNo=24,
-            expected_startEndColumns=(13, 16),
-            description="Library member symbol from different file"
-        )
-
-        # enum type symbol and enum values
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(46, 19), # symbol `Color` in function signature's parameter
-            expected_uri=LIB_URI,
-            expected_lineNo=13,
-            expected_startEndColumns=(5, 10),
-            description="Enum type"
-        )
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(48, 24), # symbol `Red` in `Color.Red`
-            expected_uri=LIB_URI,
-            expected_lineNo=15,
-            expected_startEndColumns=(4, 7),
-            description="Enum value"
-        )
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(48, 24), # symbol `Red` in `Color.Red`
-            expected_uri=LIB_URI,
-            expected_lineNo=15,
-            expected_startEndColumns=(4, 7),
-            description="Enum value"
-        )
-
-        # local variable declarations
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(49, 17), # symbol `e` in `(c == e)`
-            expected_uri=FILE_URI,
-            expected_lineNo=48,
-            expected_startEndColumns=(14, 15),
-            description="local variable declaration"
-        )
-
-        # User defined type
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(58, 8), # symbol `Price` in `Price p ...`
-            expected_uri=FILE_URI,
-            expected_lineNo=55,
-            expected_startEndColumns=(9, 14),
-            description="User defined type on left hand side"
-        )
-
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(58, 18), # symbol `Price` in `Price.wrap()` expected_uri=FILE_URI,
-            expected_uri=FILE_URI,
-            expected_lineNo=55,
-            expected_startEndColumns=(9, 14),
-            description="User defined type on right hand side."
-        )
-
-        # struct constructor also properly jumps to the struct's declaration.
-        self.expect_goto_definition_location(
-            solc=solc,
-            document_uri=FILE_URI,
-            document_position=(64, 33), # symbol `RGBColor` right hand side expression.
-            expected_uri=LIB_URI,
-            expected_lineNo=38,
-            expected_startEndColumns=(7, 15),
-            description="Struct constructor."
-        )
+        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 37, (8, 19)) # unused variable in lib.sol
 
     def test_textDocument_definition_imports(self, solc: JsonRpcProcess) -> None:
         self.setup_lsp(solc)
@@ -1054,7 +1401,7 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(published_diagnostics), 2, "publish diagnostics for 2 files")
         self.expect_equal(len(published_diagnostics[0]['diagnostics']), 0)
         self.expect_equal(len(published_diagnostics[1]['diagnostics']), 1)
-        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 33, (8, 19)) # unused variable in lib.sol
+        self.expect_diagnostic(published_diagnostics[1]['diagnostics'][0], 2072, 37, (8, 19)) # unused variable in lib.sol
 
         # import directive: test symbol alias
         self.expect_goto_definition_location(
@@ -1233,6 +1580,7 @@ class SolidityLSPTestSuite: # {{{
     # }}}
 
 if __name__ == "__main__":
+    tty.setcbreak(sys.stdin.fileno())
     suite = SolidityLSPTestSuite()
     exit_code = suite.main()
     sys.exit(exit_code)
