@@ -8,6 +8,7 @@ Compiler Features:
 
 
 Bugfixes:
+ * Type Checker: Properly check restrictions of ``using ... global`` in conjunction with libraries.
 
 
 
