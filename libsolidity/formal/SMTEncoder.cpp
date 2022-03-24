@@ -2955,7 +2955,8 @@ set<FunctionDefinition const*, ASTNode::CompareByID> const& SMTEncoder::contract
 					if (
 						function->name() == baseFunction->name() &&
 						function->kind() == baseFunction->kind() &&
-						FunctionType(*function).asExternallyCallableFunction(false)->
+						// TODO
+						FunctionType(*function).asExternallyCallableFunction(	false)->
 							hasEqualParameterTypes(*FunctionType(*baseFunction).asExternallyCallableFunction(false))
 						)
 					{

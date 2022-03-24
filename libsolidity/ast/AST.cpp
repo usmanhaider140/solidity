@@ -480,6 +480,7 @@ FunctionDefinition const& FunctionDefinition::resolveVirtual(
 	solAssert(isOrdinary(), "");
 	solAssert(!libraryFunction(), "");
 
+	// TODO I think we should never convert here, nor down.
 	FunctionType const* functionType = TypeProvider::function(*this)->asExternallyCallableFunction(false);
 
 	bool foundSearchStart = (_searchStart == nullptr);

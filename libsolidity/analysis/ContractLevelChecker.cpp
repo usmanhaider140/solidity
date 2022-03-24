@@ -41,6 +41,7 @@ namespace
 template <class T, class B>
 bool hasEqualParameters(T const& _a, B const& _b)
 {
+	// TODO this is only used to find duplicate definitions in error reporting.
 	return FunctionType(_a).asExternallyCallableFunction(false)->hasEqualParameterTypes(
 		*FunctionType(_b).asExternallyCallableFunction(false)
 	);
