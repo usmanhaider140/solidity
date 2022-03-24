@@ -12,7 +12,6 @@ contract B is A {
         return a[0];
     }
 }
-// ====
-// compileViaYul: also
 // ----
-// test() -> 0
+// TypeError 7792: (279-287): Function has override specified but does not override anything.
+// TypeError 3656: (214-336): Contract "B" should be marked as abstract.
