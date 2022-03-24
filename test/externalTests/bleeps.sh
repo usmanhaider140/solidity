@@ -86,6 +86,11 @@ function bleeps_test
     npm install npm-run-all
     npm install
 
+    # TODO: Remove this when OpenZeppelin merges https://github.com/OpenZeppelin/openzeppelin-contracts/pull/3293
+    perl -i -0pe \
+        "s/(function hashProposal\(\n        address\[\] )calldata( targets,\n        uint256\[\] )calldata( values,\n        bytes\[\] )calldata( calldatas,)/\1memory\2memory\3memory\4/g" \
+        node_modules/@openzeppelin/contracts/governance/IGovernor.sol
+
     replace_version_pragmas
 
     for preset in $SELECTED_PRESETS; do
