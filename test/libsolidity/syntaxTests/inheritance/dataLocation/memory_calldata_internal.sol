@@ -13,5 +13,4 @@ contract B is A {
     }
 }
 // ----
-// TypeError 7792: (279-287): Function has override specified but does not override anything.
-// TypeError 3656: (214-336): Contract "B" should be marked as abstract.
+// TypeError 7723: (236-334): Data locations of parameters have to be the same when overriding, but they differ.

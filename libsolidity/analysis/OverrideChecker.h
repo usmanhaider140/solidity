@@ -85,6 +85,7 @@ public:
 	langutil::Token functionKind() const;
 
 	FunctionType const* functionType() const;
+	FunctionType const* specificFunctionType() const;
 	ModifierType const* modifierType() const;
 
 	Declaration const* declaration() const;

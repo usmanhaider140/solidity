@@ -319,16 +319,27 @@ FunctionType const* OverrideProxy::functionType() const
 		[&](FunctionDefinition const* _item)
 		{
 							  // TODO Why do we generate override proxies for constructors?
-			if (!_item->isConstructor() && _item->visibility() == Visibility::External)
-				return FunctionType(*_item).asExternallyCallableFunction(false);
-			else
-				return &dynamic_cast<FunctionType const&>(*_item->typeViaContractName());
+			return FunctionType(*_item).asExternallyCallableFunction(false);
 		},
 		[&](VariableDeclaration const* _item) {
 		/* TODO */
 			return FunctionType(*_item).asExternallyCallableFunction(false);
 		},
 		[&](ModifierDefinition const*) -> FunctionType const* { solAssert(false, "Requested function type of modifier."); return nullptr; }
+	}, m_item);
+}
+
+FunctionType const* OverrideProxy::specificFunctionType() const
+{
+	return std::visit(GenericVisitor{
+		[&](FunctionDefinition const* _item)
+		{
+			return TypeProvider::function(*_item);
+		},
+		[&](VariableDeclaration const*) -> FunctionType const* {
+			solAssert(false, "Requested specifig function type of variable."); return nullptr;
+		},
+		[&](ModifierDefinition const*) -> FunctionType const* { solAssert(false, "Requested specific function type of modifier."); return nullptr; }
 	}, m_item);
 }
 
@@ -602,16 +613,52 @@ void OverrideChecker::checkOverride(OverrideProxy const& _overriding, OverridePr
 		FunctionType const* functionType = _overriding.functionType();
 		FunctionType const* superType = _super.functionType();
 
+		bool returnTypesDifferAlready = false;
 		if (_overriding.functionKind() != Token::Fallback)
 		{
 			solAssert(functionType->hasEqualParameterTypes(*superType), "Override doesn't have equal parameters!");
 
+			// TODO this also only checks the external version,
+			// i.e. if something returns calldata, it can override something returning memory.
 			if (!functionType->hasEqualReturnTypes(*superType))
+			{
+				returnTypesDifferAlready = true;
 				overrideError(
 					_overriding,
 					_super,
 					4822_error,
 					"Overriding " + _overriding.astNodeName() + " return types differ.",
+					"Overridden " + _overriding.astNodeName() + " is here:"
+				);
+			}
+		}
+
+		// The override proxy considers calldata and memory the same data location.
+		// Here we do a more specific check:
+		// Data locations of parameters and return variables have to match
+		// unless we have a public function overriding an external one.
+		if (
+			_overriding.isFunction() &&
+			!returnTypesDifferAlready &&
+			_super.visibility() != Visibility::External &&
+			_overriding.functionKind() != Token::Fallback
+		)
+		{
+			if (!_overriding.specificFunctionType()->hasEqualParameterTypes(*_super.specificFunctionType()))
+				overrideError(
+					_overriding,
+					_super,
+					7723_error,
+					"Data locations of parameters have to be the same when overriding, but they differ.",
+					"Overridden " + _overriding.astNodeName() + " is here:"
+				);
+			// TODO Can this be combined with 4822?
+			if (!_overriding.specificFunctionType()->hasEqualReturnTypes(*_super.specificFunctionType()))
+				overrideError(
+					_overriding,
+					_super,
+					1443_error,
+					"Data locations of return variables have to be the same when overriding, but they differ.",
 					"Overridden " + _overriding.astNodeName() + " is here:"
 				);
 		}
