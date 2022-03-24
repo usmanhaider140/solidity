@@ -15,7 +15,6 @@ import queue
 import threading
 from copy import deepcopy
 from typing import Any, List, Optional, Tuple, Union
-from enum import Enum, auto
 from itertools import islice
 
 import colorama # Enables the use of SGR & CUP terminal VT sequences on Windows.
@@ -58,8 +57,8 @@ def tagsOnly(lines, start=0):
 
     def hasTag(line):
         if line.find("// ") != -1:
-            for kind, regex in TAG_REGEXES._asdict().items():
-                if regex.search(line[len("// "):]) != None:
+            for _, regex in TAG_REGEXES._asdict().items():
+                if regex.search(line[len("// "):]) is not None:
                     return True
         return False
 
@@ -117,11 +116,11 @@ class JsonRpcProcess:
         timeout = 1 if block else 0
 
         if peek:
-            if self.last_message == None:
+            if self.last_message is None:
                 self.last_message = self.messages.get(block, timeout)
             return self.last_message
 
-        if self.last_message != None:
+        if self.last_message is not None:
             msg = self.last_message
             self.last_message = None
             return msg
@@ -132,7 +131,7 @@ class JsonRpcProcess:
         def run_loop():
             while True:
                 msg = self.receive_message()
-                if msg == None:
+                if msg is None:
                     break
                 self.messages.put(msg)
 
@@ -216,8 +215,7 @@ SGR_STATUS_OKAY = '\033[1;32m'
 SGR_STATUS_FAIL = '\033[1;31m'
 
 class ExpectationFailed(Exception):
-    def __init__(self, msg: str):
-        super().__init__(msg)
+    pass
 
 class JSONExpectationFailed(ExpectationFailed):
     def __init__(self, actual, expected):
@@ -310,7 +308,7 @@ class TestParser:
     def parse(self):
         yield self.parseDiagnostics()
 
-        while self.currentLine != None:
+        while self.currentLine is not None:
             yield self.RequestAndResponse(**self.parseRequestAndResponse())
             self.nextLine()
 
@@ -318,13 +316,13 @@ class TestParser:
     def parseDiagnostics(self):
         diagnostics = { "tests": {} }
 
-        if self.currentLine != None:
+        if self.currentLine is not None:
             diagnostics["start"] = self.position()
 
-        while self.currentLine != None:
+        while self.currentLine is not None:
             print(self.currentLine)
             fileDiagMatch = TEST_REGEXES.fileDiagnostics.match(self.line())
-            if fileDiagMatch == None:
+            if fileDiagMatch is None:
                 diagnostics["end"] = self.position()
                 break
 
@@ -352,7 +350,7 @@ class TestParser:
 
         # Parse request header
         requestResult = TEST_REGEXES.sendRequest.match(self.line())
-        if requestResult != None:
+        if requestResult is not None:
             ret["method"] = requestResult.group("method")
             ret["request"] = "{\n"
         else:
@@ -361,7 +359,7 @@ class TestParser:
         self.nextLine()
 
         # Search for request block end
-        while self.currentLine != None:
+        while self.currentLine is not None:
             line = self.line()
             ret["request"] += line[len(COMMENT_PREFIX):] + "\n"
 
@@ -371,7 +369,7 @@ class TestParser:
                 break
 
             # Reached end without finding block_end. Abort.
-            if self.currentLine == None:
+            if self.currentLine is None:
                 raise TestParserException(ret, "Request body not found")
 
 
@@ -385,7 +383,7 @@ class TestParser:
         self.nextLine()
 
         # Search for request block end
-        while self.currentLine != None:
+        while self.currentLine is not None:
             ret["response"] += self.line()[len(COMMENT_PREFIX):] + "\n"
 
             if self.line().startswith(BLOCK_END):
@@ -395,7 +393,7 @@ class TestParser:
             self.nextLine()
 
             # Reached end without finding block_end. Abort.
-            if self.currentLine == None:
+            if self.currentLine is None:
                 raise TestParserException(ret, "Response footer not found")
 
         return ret
@@ -540,7 +538,7 @@ class SolidityLSPTestSuite: # {{{
         reports = []
 
 #        import pdb; pdb.set_trace()
-        for num in range(0, count):
+        for _ in range(0, count):
             try:
                 message = solc.read_message(peek=True, block=True)
             except:
@@ -578,7 +576,7 @@ class SolidityLSPTestSuite: # {{{
             for diagnostic in diagnostics["diagnostics"]:
                 tag = self.find_tag_with_range(testname, diagnostic['range'])
 
-                if tag == None:
+                if tag is None:
                     raise Exception(f"No tag found for diagnostic range {diagnostic['range']}")
 
                 expectations += f" {tag} {diagnostic['code']}"
@@ -587,8 +585,6 @@ class SolidityLSPTestSuite: # {{{
         return expectations
 
     def update_diagnostics_in_file(self, solc: JsonRpcProcess, test, content, diagStart, diagEnd):
-        new_diagnostics = self.fetch_and_format_diagnostics(solc, test)
-
         content = content[:diagStart] + \
             self.fetch_and_format_diagnostics(solc, test) + \
             content[diagEnd:]
@@ -743,11 +739,11 @@ class SolidityLSPTestSuite: # {{{
         return replace_tag(contentJson, markersFallback)
 
 
-    def find_tag_with_range(self, test, range):
+    def find_tag_with_range(self, test, target_range):
         markers = self.get_file_tags(test)
 
-        for tag, tagRange in markers.items():
-            if tagRange == range:
+        for tag, tag_range in markers.items():
+            if tag_range == target_range:
                 return str(tag)
 
         return None
@@ -783,7 +779,6 @@ class SolidityLSPTestSuite: # {{{
                         editor = os.environ.get('VISUAL', os.environ.get('EDITOR', 'vi'))
                         subprocess.run(f'{editor} {self.get_test_file_path(test)}', shell=True)
                         self.get_file_tags.cache_clear()
-                        pass
                     elif userResponse == "r":
                         print("retrying...")
                         self.get_file_tags.cache_clear()
@@ -1031,8 +1026,9 @@ class SolidityLSPTestSuite: # {{{
                                 expected_diagnostics if diagnostic['range'] ==
                                 lMarkers[x.marker]), None)
 
-                            if expected_diagnostic == None:
-                                raise ExpectationFailed(f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
+                            if expected_diagnostic is None:
+                                raise ExpectationFailed(
+                                    f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
 
                             #import pdb; pdb.set_trace()
                             self.expect_diagnostic(
@@ -1063,7 +1059,13 @@ class SolidityLSPTestSuite: # {{{
 
                             print("Received more diagnostics than expected: \n" +
                                 json.dumps(actualResponseJson["params"], indent=4, sort_keys=True))
-                            self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostics.start, expectedDiagnostics.end)
+                            self.userInteractionFailedDiagnostics(
+                                solc,
+                                test,
+                                content,
+                                expectedDiagnostics.start,
+                                expectedDiagnostics.end
+                            )
                             break
 
 
@@ -1080,7 +1082,7 @@ class SolidityLSPTestSuite: # {{{
                             print("Request failed: \n" + testcase.request)
                             actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
 
-                            if expectedResponseJson == None:
+                            if expectedResponseJson is None:
                                 print("Failed to parse expected response, received: \n" + actualResponsePretty)
                             else:
                                 print("Expected:\n" + \
@@ -1358,7 +1360,6 @@ class SolidityLSPTestSuite: # {{{
         self.setup_lsp(solc)
         FILE_NAME = 'goto_definition'
         FILE_URI = self.get_test_file_uri(FILE_NAME)
-        LIB_URI = self.get_test_file_uri('lib')
         solc.send_message('textDocument/didOpen', {
             'textDocument': {
                 'uri': FILE_URI,
