@@ -76,7 +76,7 @@ contract FixedFeeRegistrar is Registrar {
 // compileViaYul: also
 // ----
 // constructor()
-// gas irOptimized: 415125
+// gas irOptimized: 414897
 // gas legacy: 935817
 // gas legacyOptimized: 489951
 // reserve(string), 69 ether: 0x20, 3, "abc" ->

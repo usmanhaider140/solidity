@@ -51,7 +51,7 @@ contract test {
 // compileViaYul: also
 // ----
 // constructor()
-// gas irOptimized: 629520
+// gas irOptimized: 629280
 // gas legacy: 1127730
 // gas legacyOptimized: 753807
 // toSlice(string): 0x20, 11, "hello world" -> 11, 0xa0
