@@ -27,6 +27,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <string>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -187,21 +188,15 @@ std::string StdioTransport::readBytes(size_t _byteCount)
 	auto const n = fread(buffer.data(), 1, _byteCount, stdin);
 	if (n < _byteCount)
 		buffer.resize(n);
-	lspDebug(fmt::format("StdioTransport.readBytes({};{};{}): \"{}\"",
-				_byteCount, n, buffer.size(), buffer));
+	lspDebug(fmt::format("StdioTransport.readBytes({};{};{}): \"{}\"", _byteCount, n, buffer.size(), buffer));
 	return buffer;
 }
 
 std::string StdioTransport::getline()
 {
-	char* lineBuffer = nullptr;
-	size_t numBytesRead = 0;
-	auto const getlineResult = ::getline(&lineBuffer, &numBytesRead, stdin);
-	auto const ensureFreedBuffer = ScopeGuard{ [&]() { free(lineBuffer); }};
-	if (getlineResult > 0)
-		return std::string(lineBuffer, static_cast<size_t>(getlineResult));
-	else
-		return {};
+	std::string line;
+	std::getline(std::cin, line);
+	return line;
 }
 
 void StdioTransport::writeBytes(std::string_view _data)
