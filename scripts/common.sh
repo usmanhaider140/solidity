@@ -26,12 +26,7 @@ set -e
 # changes directory. The paths returned by `caller` are relative to it.
 _initial_work_dir=$(pwd)
 
-if [ -z ${CIRCLECI+x} ]
-then
-    CIRCLECI=0
-fi
-
-if [ "$CIRCLECI" ]
+if [[ ${CIRCLECI:-} != "" ]]
 then
     export TERM="${TERM:-xterm}"
     function printTask { echo "$(tput bold)$(tput setaf 2)$1$(tput setaf 7)"; }
@@ -176,6 +171,7 @@ function msg_on_error
     fi
 }
 
+
 function diff_values
 {
     (( $# >= 2 )) || fail "diff_values requires at least 2 arguments."
@@ -185,7 +181,21 @@ function diff_values
     shift
     shift
 
-    diff --unified=0 <(echo "$value1") <(echo "$value2") "$@"
+    if ! diff --unified=0 <(echo "$value1") <(echo "$value2") "$@"
+    then
+        if [ "${DIFFVIEW:-}" == "" ]
+        then
+            printError "ERROR: values differ: '${value1}' vs. '${value2}'"
+            printError "Expected:"
+            printError "${value1}"
+            printError "Obtained:"
+            printError "${value2}"
+        else
+            # Use user supplied diff view binary
+            "$DIFFVIEW" "${file1}" "${file2}"
+        fi
+        return 1
+    fi
 }
 
 function diff_files
@@ -197,11 +207,9 @@ function diff_files
     shift
     shift
 
-    diff "${file1}" "${file2}"
-    local res=$?
-    if [[ $res != 0 ]]
+    if ! diff "${file1}" "${file2}"
     then
-        if [ "$DIFFVIEW" == "" ]
+        if [ "${DIFFVIEW:-}" == "" ]
         then
             printError "ERROR: files differ: ${file1} vs. ${file2}"
             printError "Expected:"
