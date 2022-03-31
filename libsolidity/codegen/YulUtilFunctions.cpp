@@ -31,6 +31,8 @@
 #include <libsolutil/StringUtils.h>
 #include <libsolidity/ast/TypeProvider.h>
 
+#include <range/v3/view/enumerate.hpp>
+
 using namespace std;
 using namespace solidity;
 using namespace solidity::util;
@@ -3271,6 +3273,11 @@ string YulUtilFunctions::conversionFunction(Type const& _from, Type const& _to)
 		solAssert(_to.category() == Type::Category::Array, "");
 		return arrayConversionFunction(fromArrayType, dynamic_cast<ArrayType const&>(_to));
 	}
+	else if (_from.category() == Type::Category::InlineArray)
+	{
+		solAssert(_to.category() == Type::Category::Array, "");
+		return inlineArrayConversionFunction(dynamic_cast<InlineArrayType const&>(_from), dynamic_cast<ArrayType const&>(_to));
+	}
 
 	if (_from.sizeOnStack() != 1 || _to.sizeOnStack() != 1)
 		return conversionFunctionSpecial(_from, _to);
@@ -3715,6 +3722,67 @@ string YulUtilFunctions::arrayConversionFunction(ArrayType const& _from, ArrayTy
 			);
 		else
 			solAssert(false, "");
+
+		return templ.render();
+	});
+}
+
+string YulUtilFunctions::inlineArrayConversionFunction(InlineArrayType const& _from, ArrayType const& _to)
+{
+	if (_to.dataStoredIn(DataLocation::CallData))
+		solAssert(false);
+
+	if (!_to.isDynamicallySized())
+		solAssert(_to.length() == _from.components().size());
+
+	// TODO
+	// Other cases are done explicitly in LValue::storeValue, and only possible by assignment.
+	/*if (_to.location() == DataLocation::Storage)
+		solAssert(
+			(_to.isPointer() || (_from.isByteArrayOrString() && _to.isByteArrayOrString())) &&
+			_from.location() == DataLocation::Storage,
+			"Invalid conversion to storage type."
+		);
+	*/
+	string functionName =
+		"convert_inline_array_" +
+		_from.identifier() +
+		"_to_" +
+		_to.identifier();
+
+
+	return m_functionCollector.createFunction(functionName, [&]() {
+		Whiskers templ(R"(
+			function <functionName>(<values>) -> converted {
+				converted := <allocateArray>(<length>)
+				let mpos := converted
+				<?toDynamic>mpos := add(mpos, 0x20)</toDynamic>
+
+				<#elements>
+				mstore(add(mpos, <offset>), <conversionFunction>(<value>))
+				</elements>
+			}
+		)");
+		templ("functionName", functionName);
+		templ("allocateArray", allocateMemoryArrayFunction(_to));
+		templ("length", toCompactHexWithPrefix(_from.components().size()));
+		templ("toDynamic", _to.isDynamicallySized());
+		templ("values", suffixedVariableNameList("var_", 0, _from.sizeOnStack()));
+
+		vector<map<string, string>> elements;
+		unsigned stackItemIndex = 0;
+		for (auto&& [index, type]: _from.components() | ranges::views::enumerate)
+		{
+			elements.emplace_back();
+			elements.back()["offset"] = to_string(0x20 * index);
+
+			elements.back()["value"] = suffixedVariableNameList("var_", stackItemIndex, stackItemIndex + type->sizeOnStack());
+
+			elements.back()["conversionFunction"] = conversionFunction(*type, *_to.baseType());
+			stackItemIndex += type->sizeOnStack();
+		}
+
+		templ("elements", move(elements));
 
 		return templ.render();
 	});

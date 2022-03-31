@@ -1582,7 +1582,7 @@ bool TypeChecker::visit(TupleExpression const& _tuple)
 	else
 	{
 		bool isPure = true;
-		Type const* inlineArrayType = nullptr;
+		//Type const* inlineArrayType = nullptr;
 
 		for (size_t i = 0; i < components.size(); ++i)
 		{
@@ -1596,6 +1596,7 @@ bool TypeChecker::visit(TupleExpression const& _tuple)
 				if (dynamic_cast<TupleType const&>(*types[i]).components().empty())
 				{
 					if (_tuple.isInlineArray())
+						// TODO change to na fatal error
 						m_errorReporter.fatalTypeError(5604_error, components[i]->location(), "Array component cannot be empty.");
 					m_errorReporter.typeError(6473_error, components[i]->location(), "Tuple component cannot be empty.");
 				}
@@ -1605,22 +1606,11 @@ bool TypeChecker::visit(TupleExpression const& _tuple)
 				if (!dynamic_cast<RationalNumberType const&>(*types[i]).mobileType())
 					m_errorReporter.fatalTypeError(3390_error, components[i]->location(), "Invalid rational number.");
 
-			if (_tuple.isInlineArray())
-			{
-				solAssert(!!types[i], "Inline array cannot have empty components");
-
-				if ((i == 0 || inlineArrayType) && !types[i]->mobileType())
-					m_errorReporter.fatalTypeError(9563_error, components[i]->location(), "Invalid mobile type.");
-
-				if (i == 0)
-					inlineArrayType = types[i]->mobileType();
-				else if (inlineArrayType)
-					inlineArrayType = Type::commonType(inlineArrayType, types[i]);
-			}
 			if (!*components[i]->annotation().isPure)
 				isPure = false;
 		}
 		_tuple.annotation().isPure = isPure;
+		/* TODO: what about mapping part?
 		if (_tuple.isInlineArray())
 		{
 			if (!inlineArrayType)
@@ -1639,14 +1629,14 @@ bool TypeChecker::visit(TupleExpression const& _tuple)
 				);
 
 			_tuple.annotation().type = TypeProvider::array(DataLocation::Memory, inlineArrayType, types.size());
-		}
+		}*/
+
+		if (_tuple.isInlineArray())
+			_tuple.annotation().type = TypeProvider::inlineArray(move(types));
+		else if (components.size() == 1)
+			_tuple.annotation().type = type(*components[0]);
 		else
-		{
-			if (components.size() == 1)
-				_tuple.annotation().type = type(*components[0]);
-			else
-				_tuple.annotation().type = TypeProvider::tuple(move(types));
-		}
+			_tuple.annotation().type = TypeProvider::tuple(move(types));
 
 		_tuple.annotation().isLValue = false;
 	}
@@ -3765,8 +3755,7 @@ bool TypeChecker::expectType(Expression const& _expression, Type const& _expecte
 	if (!result)
 	{
 		auto errorMsg = "Type " +
-			type(_expression)->toString() +
-			" is not implicitly convertible to expected type " +
+			type(_expression)->toString() +			" is not implicitly convertible to expected type " +
 			_expectedType.toString();
 		if (
 			type(_expression)->category() == Type::Category::RationalNumber &&

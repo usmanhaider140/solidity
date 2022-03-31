@@ -492,8 +492,8 @@ bool IRGeneratorForStatements::visit(TupleExpression const& _tuple)
 {
 	setLocation(_tuple);
 
-	if (_tuple.isInlineArray())
-	{
+	//if (_tuple.isInlineArray())
+	/*{
 		auto const& arrayType = dynamic_cast<ArrayType const&>(*_tuple.annotation().type);
 		solAssert(!arrayType.isDynamicallySized(), "Cannot create dynamically sized inline array.");
 		define(_tuple) <<
@@ -518,13 +518,13 @@ bool IRGeneratorForStatements::visit(TupleExpression const& _tuple)
 				converted.commaSeparatedList() <<
 				")\n";
 		}
-	}
-	else
+	}*/
+	//else
 	{
 		bool willBeWrittenTo = _tuple.annotation().willBeWrittenTo;
 		if (willBeWrittenTo)
 			solAssert(!m_currentLValue);
-		if (_tuple.components().size() == 1)
+		if (!_tuple.isInlineArray() && _tuple.components().size() == 1)
 		{
 			solAssert(_tuple.components().front());
 			_tuple.components().front()->accept(*this);

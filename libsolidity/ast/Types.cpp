@@ -2698,6 +2698,82 @@ Type const* TupleType::mobileType() const
 	return TypeProvider::tuple(move(mobiles));
 }
 
+BoolResult InlineArrayType::isImplicitlyConvertibleTo(Type const& _other) const
+{
+	if (auto arrayType = dynamic_cast<ArrayType const*>(&_other))
+	{
+		if (!arrayType->isDynamicallySized())
+		{
+			if (arrayType->length() != components().size())
+				return false; //TODO return string
+		}
+
+		auto componets = components();
+		for (size_t i = 0; i < componets.size(); ++i)
+		{
+			if (!componets[i]->isImplicitlyConvertibleTo(*arrayType->baseType()))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+	else
+		return false;
+}
+
+string InlineArrayType::richIdentifier() const
+{
+	return "t_inline_array" + identifierList(components());
+}
+
+bool InlineArrayType::operator==(Type const& _other) const
+{
+	if (auto inlineArrayType = dynamic_cast<InlineArrayType const*>(&_other))
+		// TODO: raise issue - do not compare by pointer for tuple type
+		return components() == inlineArrayType->components();
+	else
+		return false;
+}
+
+string InlineArrayType::toString(bool _short) const
+{
+	vector<string> result;
+
+	for (auto const& t: components())
+		result.push_back(t->toString(_short));
+
+	// TODO joinHumanReadable - is it fine to have a space here?
+	return "inline_array(" + util::joinHumanReadable(result) + ")";
+}
+
+u256 InlineArrayType::storageSize() const
+{
+	solAssert(false, "Storage size of non-storable InlineArrayType type requested.");
+}
+
+Type const* InlineArrayType::mobileType() const
+{
+	solUnimplemented("Decide it it has a mobile type");
+}
+
+vector<tuple<string, Type const*>> InlineArrayType::makeStackItems() const
+{
+	vector<tuple<string, Type const*>> slots;
+	unsigned i = 1;
+	for (auto const& t: components())
+	{
+		slots.emplace_back("component_" + std::to_string(i), t);
+		++i;
+	}
+	return slots;
+
+	//TODO do we want to keep everything on the stack?
+	//return {std::make_tuple("mpos", TypeProvider::uint256())};
+}
+
+
 FunctionType::FunctionType(FunctionDefinition const& _function, Kind _kind):
 	m_kind(_kind),
 	m_stateMutability(_function.stateMutability()),
