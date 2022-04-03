@@ -63,17 +63,6 @@ inline std::vector<bool>& operator|=(std::vector<bool>& _x, std::vector<bool> co
 	return _x;
 }
 
-/**
- * Simplex tableau.
- */
-struct Tableau
-{
-	/// The factors of the objective function (first row of the tableau)
-	LinearExpression objective;
-	/// The tableau matrix (equational form).
-	std::vector<LinearExpression> data;
-};
-
 string toString(rational const& _x)
 {
 	if (_x == bigint(1) << 256)
@@ -95,338 +84,6 @@ string reasonToString(ReasonSet const& _reasons, size_t _minSize)
 	return result;
 }
 
-/*
-string toString(LinearExpression const& _expr)
-{
-	vector<string> items;
-	for (auto&& multiplier: _expr)
-		 if (multiplier != 0)
-			items.emplace_back(::toString(multiplier));
-		else
-			items.emplace_back("_");
-	for (string& item: items)
-		while (item.size() < 3)
-			item = " " + item;
-	return joinHumanReadable(items, " ");
-}
-
-string toString(Tableau const& _tableau)
-{
-	string s = toString(_tableau.objective) + "\n";
-	for (auto&& d: _tableau.data)
-		s += toString(d) + "\n";
-	return s;
-}
-
-
-/// Adds slack variables to remove non-equality costraints from a set of constraints
-/// and returns the data part of the tableau / constraints.
-/// The second return variable is true if the original input had any equality constraints.
-pair<vector<LinearExpression>, bool> toEquationalForm(vector<Constraint> _constraints)
-{
-	size_t varsNeeded = static_cast<size_t>(ranges::count_if(_constraints, [](Constraint const& _c) { return !_c.equality; }));
-	if (varsNeeded > 0)
-	{
-		size_t columns = _constraints.at(0).data.size();
-		size_t varsAdded = 0;
-		for (Constraint& constraint: _constraints)
-		{
-			solAssert(constraint.data.size() == columns, "");
-			constraint.data.resize(columns + varsNeeded);
-			if (!constraint.equality)
-			{
-				constraint.equality = true;
-				constraint.data[columns + varsAdded] = bigint(1);
-				varsAdded++;
-			}
-		}
-		solAssert(varsAdded == varsNeeded);
-	}
-
-	vector<LinearExpression> data;
-	for (Constraint& c: _constraints)
-		data.emplace_back(move(c.data));
-
-	return make_pair(move(data), varsNeeded < _constraints.size());
-}
-
-/// Finds the simplex pivot column: The column with the largest positive objective factor.
-/// If all objective factors are zero or negative, the optimum has been found and nullopt is returned.
-optional<size_t> findPivotColumn(Tableau const& _tableau)
-{
-	auto&& [maxColumn, maxValue] = ranges::max(
-		_tableau.objective.enumerateTail(),
-		{},
-		[](std::pair<size_t, rational> const& _x) { return _x.second; }
-	);
-
-	if (maxValue <= rational{0})
-		return nullopt; // found optimum
-	else
-		return maxColumn;
-}
-
-/// Finds the simplex pivot row, given the column:
-/// If there is no positive factor in the column, the problem is unbounded, nullopt is returned.
-/// Otherwise, returns the row i such that c[i] / x[i] is minimal and x[i] is positive, where
-/// c[i] is the constant factor (not the objective factor!) in row i.
-optional<size_t> findPivotRow(Tableau const& _tableau, size_t _pivotColumn)
-{
-	auto positiveColumnEntries =
-		ranges::views::iota(size_t(0), _tableau.data.size()) |
-		ranges::views::transform([&](size_t i) {
-			return make_pair(i, _tableau.data[i][_pivotColumn]);
-		}) |
-		ranges::views::filter([](pair<size_t, rational> const& _entry) {
-			return _entry.second.numerator() > 0;
-		});
-	if (positiveColumnEntries.empty())
-		return nullopt; // unbounded
-
-	return ranges::min(
-		positiveColumnEntries,
-		{},
-		[&](std::pair<size_t, rational> const& _entry) {
-			return _tableau.data[_entry.first][0] / _entry.second;
-		}
-	).first;
-}
-
-/// Performs equivalence transform on @a _tableau, so that
-/// the column @a _pivotColumn is all zeros (including the objective row) except for @a _pivotRow,
-/// where it is 1.
-void performPivot(Tableau& _tableau, size_t _pivotRow, size_t _pivotColumn)
-{
-	rational pivot = _tableau.data[_pivotRow][_pivotColumn];
-	solAssert(pivot != 0, "");
-	if (pivot != 1)
-		_tableau.data[_pivotRow] /= pivot;
-	solAssert(_tableau.data[_pivotRow][_pivotColumn] == rational(1), "");
-
-	LinearExpression const& _pivotRowData = _tableau.data[_pivotRow];
-	auto subtractMultipleOfPivotRow = [&](LinearExpression& _row) {
-		if (_row[_pivotColumn] == rational{1})
-			_row -= _pivotRowData;
-		else if (_row[_pivotColumn] == rational{-1})
-			_row += _pivotRowData;
-		else if (_row[_pivotColumn])
-			_row -= _row[_pivotColumn] * _pivotRowData;
-	};
-
-	subtractMultipleOfPivotRow(_tableau.objective);
-	for (size_t i = 0; i < _tableau.data.size(); ++i)
-		if (i != _pivotRow)
-			subtractMultipleOfPivotRow(_tableau.data[i]);
-}
-
-/// Transforms the tableau such that the last vectors are basis vectors
-/// and their objective coefficients are zero.
-/// Makes various assumptions and should only be used after adding
-/// a certain number of slack variables.
-void selectLastVectorsAsBasis(Tableau& _tableau)
-{
-	// We might skip the operation for a column if it is already the correct
-	// unit vector and its objective coefficient is zero.
-	size_t columns = _tableau.objective.size();
-	size_t rows = _tableau.data.size();
-	for (size_t i = 0; i < rows; ++i)
-		performPivot(_tableau, i, columns - rows + i);
-}
-
-/// If column @a _column inside tableau is a basis vector
-/// (i.e. one entry is 1, the others are 0), returns the index
-/// of the 1, otherwise nullopt.
-optional<size_t> basisIndex(Tableau const& _tableau, size_t _column)
-{
-	optional<size_t> row;
-	for (size_t i = 0; i < _tableau.data.size(); ++i)
-		if (_tableau.data[i][_column] == bigint(1))
-		{
-			if (row)
-				return std::nullopt;
-			else
-				row = i;
-		}
-		else if (_tableau.data[i][_column] != 0)
-			return std::nullopt;
-	return row;
-}
-
-/// @returns a solution vector, assuming one exists.
-/// The solution vector minimizes the objective function if the tableau
-/// is the result of the simplex algorithm.
-vector<rational> solutionVector(Tableau const& _tableau)
-{
-	vector<rational> result;
-	vector<bool> rowsSeen(_tableau.data.size(), false);
-	for (size_t j = 1; j < _tableau.objective.size(); j++)
-	{
-		optional<size_t> row = basisIndex(_tableau, j);
-		if (row && rowsSeen[*row])
-			row = nullopt;
-		result.emplace_back(row ? _tableau.data[*row][0] : rational{});
-		if (row)
-			rowsSeen[*row] = true;
-	}
-	return result;
-}
-
-
-/// Solve the LP A x = b s.t. min c^T x
-/// Here, c is _tableau.objective and the first column of _tableau.data
-/// encodes b and the other columns encode A
-/// Assumes the tableau has a trivial basic feasible solution.
-/// Tries for a number of iterations and then gives up.
-pair<LPResult, Tableau> simplexEq(Tableau _tableau)
-{
-	size_t const iterations = min<size_t>(60, 50 + _tableau.objective.size() * 2);
-	for (size_t step = 0; step <= iterations; ++step)
-	{
-		optional<size_t> pivotColumn = findPivotColumn(_tableau);
-		if (!pivotColumn)
-			return make_pair(LPResult::Feasible, move(_tableau));
-		optional<size_t> pivotRow = findPivotRow(_tableau, *pivotColumn);
-		if (!pivotRow)
-			return make_pair(LPResult::Unbounded, move(_tableau));
-		performPivot(_tableau, *pivotRow, *pivotColumn);
-	}
-	return make_pair(LPResult::Unknown, Tableau{});
-}
-
-/// We add slack variables to find a basic feasible solution.
-/// In particular, there is a slack variable for each row
-/// which is weighted negatively. Setting the new slack
-/// variables to one and all other variables to zero yields
-/// a basic feasible solution.
-/// If the optimal solution has all slack variables set to zero,
-/// this is a basic feasible solution. Otherwise, the original
-/// problem is infeasible.
-/// This function returns the modified tableau with the original
-/// objective function and the slack variables removed.
-pair<LPResult, Tableau> simplexPhaseI(Tableau _tableau)
-{
-	LinearExpression originalObjective = _tableau.objective;
-
-	size_t rows = _tableau.data.size();
-	size_t columns = _tableau.objective.size();
-	for (size_t i = 0; i < rows; ++i)
-	{
-		if (_tableau.data[i][0] < 0)
-			_tableau.data[i] *= -1;
-		_tableau.data[i].resize(columns + rows);
-		_tableau.data[i][columns + i] = 1;
-	}
-	_tableau.objective = {};
-	_tableau.objective.resize(columns);
-	_tableau.objective.resize(columns + rows, rational{-1});
-
-	// This sets the objective factors of the slack variables
-	// to zero (and thus selects a basic feasible solution).
-	selectLastVectorsAsBasis(_tableau);
-
-	LPResult result;
-	tie(result, _tableau) = simplexEq(move(_tableau));
-	if (result == LPResult::Unknown)
-		return make_pair(LPResult::Unknown, Tableau{});
-	solAssert(result != LPResult::Infeasible, "");
-
-	vector<rational> optimum = solutionVector(_tableau);
-
-	// If the solution needs a nonzero factor for a slack variable,
-	// the original system is infeasible.
-	for (size_t i = columns - 1; i < optimum.size(); ++i)
-		if (optimum[i] != 0)
-			return make_pair(LPResult::Infeasible, Tableau{});
-
-	// Restore original objective and remove slack variables.
-	_tableau.objective = move(originalObjective);
-	for (auto& row: _tableau.data)
-		row.resize(columns);
-
-	return make_pair(LPResult::Feasible, move(_tableau));
-}
-
-/// Returns true if the all-zero solution is not a solution for the tableau.
-bool needsPhaseI(Tableau const& _tableau)
-{
-	for (auto const& row: _tableau.data)
-		if (row[0] < 0)
-			return true;
-	return false;
-}
-
-
-/// Solve the LP Ax <= b s.t. min c^Tx
-pair<LPResult, vector<rational>> simplex(vector<Constraint> _constraints, LinearExpression _objectives)
-{
-	Tableau tableau;
-	tableau.objective = move(_objectives);
-	bool hasEquations = false;
-	tie(tableau.data, hasEquations) = toEquationalForm(_constraints);
-	tableau.objective.resize(tableau.data.at(0).size());
-	//cout << "Running simplex on " << tableau.objective.size() << " x " << tableau.data.size() << endl;
-
-	if (hasEquations || needsPhaseI(tableau))
-	{
-		LPResult result;
-		tie(result, tableau) = simplexPhaseI(move(tableau));
-		if (result == LPResult::Infeasible || result == LPResult::Unknown)
-			return make_pair(result, vector<rational>{});
-		solAssert(result == LPResult::Feasible, "");
-	}
-	// We know that the system is satisfiable and we know a solution,
-	// but it might not be optimal.
-	LPResult result;
-	tie(result, tableau) = simplexEq(move(tableau));
-	solAssert(result != LPResult::Infeasible, "");
-	return make_pair(result, solutionVector(tableau));
-}
-
-
-/// Turns all bounds into constraints.
-/// @returns false if the bounds make the state infeasible.
-optional<ReasonSet> boundsToConstraints(SolvingState& _state)
-{
-	size_t columns = _state.variableNames.size();
-
-	// Bound zero should not exist because the variable zero does not exist.
-	for (auto const& [varIndex, bounds]: _state.bounds | ranges::views::enumerate | ranges::views::tail)
-	{
-		if (bounds.lower && bounds.upper)
-		{
-			if (*bounds.lower > *bounds.upper)
-				return bounds.lowerReasons + bounds.upperReasons;
-			if (*bounds.lower == *bounds.upper)
-			{
-				LinearExpression c;
-				c.resize(columns);
-				c[0] = *bounds.lower;
-				c[varIndex] = bigint(1);
-				_state.constraints.emplace_back(Constraint{move(c), true, bounds.lowerReasons + bounds.upperReasons});
-				continue;
-			}
-		}
-		if (bounds.lower && *bounds.lower > 0)
-		{
-			LinearExpression c;
-			c.resize(columns);
-			c[0] = -*bounds.lower;
-			c[varIndex] = bigint(-1);
-			_state.constraints.emplace_back(Constraint{move(c), false, move(bounds.lowerReasons)});
-		}
-		if (bounds.upper)
-		{
-			LinearExpression c;
-			c.resize(columns);
-			c[0] = *bounds.upper;
-			c[varIndex] = bigint(1);
-			_state.constraints.emplace_back(Constraint{move(c), false, move(bounds.upperReasons)});
-		}
-	}
-	_state.bounds.clear();
-	return nullopt;
-}
-*/
 
 /// Removes incides set to true from a vector-like data structure.
 template <class T>
@@ -556,8 +213,6 @@ set<size_t> SolvingState::reasons() const
 	set<size_t> ret;
 	for (Bounds const& b: bounds)
 		ret += b.lowerReasons + b.upperReasons;
-	for (Constraint const& c: constraints)
-		ret += c.reasons;
 	return ret;
 }
 
@@ -603,181 +258,236 @@ string SolvingState::toString() const
 	return result;
 }
 
-SimplexWithBounds::SimplexWithBounds(SolvingState _state):
-	m_state(move(_state))
+
+void LPSolver::addConstraint(Constraint const& _constraint, optional<size_t> _reason)
 {
-	size_t varsNeeded = m_state.constraints.size();
-	size_t row = 0;
-	// TODO the new method does not need zero as lower-bound on all variables,
-	// but we currently assume that in the BooleanLP at some places.
-	for (auto& bounds: m_state.bounds)
-		if (!bounds.lower)
-			bounds.lower = rational{0};
+	// TODO at this point, we could also determine if it is a fixed variable.
+	// (maybe even taking the bounds on existing variables into account)
+	set<size_t> touchedProblems;
+	for (auto const& [index, entry]: _constraint.data.enumerateTail())
+		if (entry)
+			if (m_subProblemsPerVariable.count(index))
+				touchedProblems.emplace(m_subProblemsPerVariable.at(index));
 
-	for (Constraint& c: m_state.constraints)
+	if (touchedProblems.empty())
 	{
-		// TODO duplicated in addConstraint
-		c.data.resize(m_state.variableNames.size() + varsNeeded);
-		size_t newVarIndex = m_state.variableNames.size();
-		m_basicVariables[newVarIndex] = row++;
-		solAssert(m_state.variableNames.size() == m_state.bounds.size());
-		// TODO name needed unique?
-		m_state.variableNames.emplace_back("_s" + to_string(newVarIndex));
-		m_state.bounds.emplace_back();
-		if (c.equality)
-			m_state.bounds.back().lower = c.data[0];
-		m_state.bounds.back().upper = c.data[0];
-		c.equality = true;
-		solAssert(c.data.size() > newVarIndex);
-		c.data[newVarIndex] = -1;
-		c.data[0] = 0;
+		//cout << "Creating new sub problem." << endl;
+		// TODO we could find an empty spot for the pointer.
+		m_subProblems.emplace_back(make_shared<SubProblem>());
+		solAssert(!m_subProblems.back()->sealed);
+		touchedProblems.emplace(m_subProblems.size() - 1);
 	}
-
-	m_assignments.resize(m_state.variableNames.size());
-	solAssert(m_assignments.size() == m_state.bounds.size());
+	for (size_t problemToErase: touchedProblems | ranges::views::tail | ranges::views::reverse)
+		combineSubProblems(*touchedProblems.begin(), problemToErase);
+	addConstraintToSubProblem(*touchedProblems.begin(), _constraint, move(_reason));
 }
 
-LPResult SimplexWithBounds::check()
+
+pair<LPResult, variant<Model, ReasonSet>> LPSolver::check()
 {
-	solAssert(m_assignments.size() == m_state.bounds.size());
-	cout << "===========================" << endl;
-	cout << "===========================" << endl;
-	cout << "simpl with bounds on\n" << toString() << endl;
+	for (auto&& [index, problem]: m_subProblems | ranges::views::enumerate)
+		if (problem)
+			problem->sealed = true;
 
-	// We start with an all-zero assignment and then gradually add
-	// the bounds we already have.
-
-	//cout << "Adjusting bounds on non-basic variables\n";
-	// Adjust the assignments so we satisfy the bounds of the non-basic variables.
-	for (auto const& [i, bounds]: m_state.bounds | ranges::views::enumerate)
+	for (auto&& [index, problem]: m_subProblems | ranges::views::enumerate)
 	{
-		if (m_basicVariables.count(i) || (!bounds.lower && !bounds.upper))
+		if (!problem)
 			continue;
-		if (bounds.lower && bounds.upper)
-			solAssert(*bounds.lower <= *bounds.upper);
-		if (bounds.lower && m_assignments[i] < *bounds.lower)
+		if (!problem->result)
+			problem->result = problem->check();
+
+		if (*proble->result == LPResult::Infeasible)
+			return {LPResult::Infeasible, problem->reasons};
+	}
+	return {LPResult::Feasible, model()};
+}
+
+LPSolver::SubProblem& LPSolver::unseal(size_t _problemIndex)
+{
+	solAssert(m_subProblems[_problemIndex]);
+	if (m_subProblems[_problemIndex]->sealed)
+		m_subProblems[_problemIndex] = make_shared<SubProblem>(*m_subProblems[_combineInto]);
+	m_subProblems[_problemIndex]->sealed = false;
+	m_subProblems[_problemIndex]->result = nullopt;
+	return *m_subProblems[_combineInto];
+}
+
+void LPSolver::combineSubProblems(size_t _combineInto, size_t _combineFrom)
+{
+	SubProblem& combineInto = unseal(_combineInto);
+	SubProblem const& combineFrom = *m_subProblems[_combineFrom];
+
+	size_t varShift = combineInto.variableNames.size() - 1;
+	size_t rowShift = combineInto.constraints.size();
+	combineInto.constraints += combineFrom.constraints;
+	combineInto.assignments += combineFrom.assignments | ranges::view::tail;
+	combineInto.variableNames += combineFrom.variableNames | ranges::view::tail;
+	combineInto.bounds += combineFrom.bounds | ranges::view::tail;
+	for (auto&& [index, row]: combineFrom.basicVariables)
+		combineInto.basicVariables.emplace(index + varShift, row + rowShift);
+	for (auto&& [outerIndex, innerIndex]: combineFrom.varMapping)
+		combineInto.basicVariables.emplace(outerIndex, innerIndex + varShift;
+	combineInto.reasons += combineFrom.reasons;
+
+	for (auto& item: m_subProblemsPerVariable)
+		if (item.second == _combineFrom)
+			item.second = _combineInto;
+
+	m_subProblems[_combineFrom].reset();
+}
+
+// TODO move into problem and make it erturn set of vaiables added
+
+void LPSolver::addConstraintToSubProblem(
+	size_t _subProblem,
+	Constraint const& _constraint,
+	std::optional<size_t> _reason
+)
+{
+	SubProblem& problem = unseal(_subProblem);
+	if (_reason)
+		problem.reasons.insert(*_reason);
+
+	for (auto const& [index, entry]: _constraint.data.enumerateTail())
+		if (entry && !problem.varMapping.count(index))
+			addOuterVariableToSubProblem(_subProblem, index);
+
+	size_t slackIndex = addNewVariableToSubProblem(_subProblem);
+	problem.basicVariables[slackIndex] = problem.constraints.size();
+	if (_constraint.equality)
+		problem.variables[slackindex].bounds.lower = _constraint.data[0];
+	problem.variables[slackindex].bounds.upper = _constraint.data[0];
+
+	Constraint compressedConstraint;
+	compressedConstraint.equality = true;
+	compressedConstraint.data.resize(1 + problem.variables.size());
+	for (auto const& [index, entry]: _constraint.data.enumerateTail())
+		if (entry)
+			compressedConstraint[problem.varMapping.at(index)] = entry;
+	compressedConstraint[slackIndex] = -1;
+	problem.constraints.emplace_back(move(compressedConstraint));
+	problem.basicVariables[slackIndex] = problem.constraints.size() - 1;
+}
+
+void LPSolver::addOuterVariableToSubProblem(size_t _subProblem, size_t _outerIndex)
+{
+	size_t index = addNewVariableToSubProblem(_subProblem);
+	problem.varMapping.emplace(_outerIndex, index);
+	m_subProblemsPerVariable[_outerIndex] = _subProblem;
+}
+
+size_t LPSolver::addNewVariableToSubProblem(size_t _subProblem)
+{
+	SubProblem& problem = unseal(_subProblem);
+	size_t index = problem.variables.size();
+	for (Constraint& c: problem.constraints)
+		c.data.resize(index + 1);
+	problem.variables.emplace_back();
+	return index;
+}
+
+map<string, rational> LPSolver::model() const
+{
+	map<string, rational> result;
+	for (auto const& problem: m_subProblems)
+		if (problem)
+			for (auto&& [outerIndex, innerIndex]: problem->varMapping)
+				result[problem->variables[innerIndex].name] = problem->variables[innerIndex].value;
+	return result;
+}
+
+LPResult LPSolver::SubProblem::check()
+{
+
+	// Adjust the assignments so we satisfy the bounds of the non-basic variables.
+	for (auto const& [i, var]: variables | ranges::views::enumerate | ranges::views::tail)
+	{
+		if (basicVariables.count(i) || (!var.bounds.lower && !var.bounds.upper))
+			continue;
+		if (var.bounds.lower && var.bounds.upper)
+			solAssert(*var.bounds.lower <= *var.bounds.upper);
+		if (var.bounds.lower && var.value < *bounds.lower)
 			update(i, *bounds.lower);
-		else if (bounds.upper && m_assignments[i] > *bounds.upper)
+		else if (bounds.upper && var.value > *bounds.upper)
 			update(i, *bounds.upper);
 	}
-	//cout << "Bounds on non-basic vaiables set.\n" << toString() << endl;
 
 	// Now try to make the basic variables happy, pivoting if necessary.
 
 	// TODO bound number of iterations
 	while (auto bvi = firstConflictingBasicVariable())
 	{
-		//cout << "Basic variable " << m_state.variableNames[*bvi] << " is conflicting." << endl;
-		if (m_state.bounds[*bvi].lower && m_assignments[*bvi] < *m_state.bounds[*bvi].lower)
+		if (variables[*bvi].bounds.lower && variables[*bvi].value < *variables[*bvi].bounds.lower)
 		{
 			if (auto replacementVar = firstReplacementVar(*bvi, true))
-				pivotAndUpdate(*bvi, *m_state.bounds.at(*bvi).lower, *replacementVar);
+				pivotAndUpdate(*bvi, *variables[*bvi].bounds.lower, *replacementVar);
 			else
-			{
-				//cout << "------->>>>>>>>>>>>>> infeasible\n";
 				return LPResult::Infeasible;
-			}
 		}
-		else if (m_state.bounds[*bvi].upper && m_assignments[*bvi] > *m_state.bounds[*bvi].upper)
+		else if (variables[*bvi].bounds.upper && variables[*bvi].value > *variables[*bvi].bounds.upper)
 		{
 			if (auto replacementVar = firstReplacementVar(*bvi, false))
-				pivotAndUpdate(*bvi, *m_state.bounds.at(*bvi).upper, *replacementVar);
+				pivotAndUpdate(*bvi, *variables[*bvi].bounds.upper, *replacementVar);
 			else
-			{
-				//cout << "------->>>>>>>>>>>>>> infeasible\n";
 				return LPResult::Infeasible;
-			}
 		}
 	}
 
-	//cout << "SAT ------->>>>>>>>>>>>>>\n";
-
 	return LPResult::Feasible;
+}
+
+void LPSolver::SubProblem::update(size_t _varIndex, rational const& _value)
+{
+	rational delta = _value - variables[_varIndex].value;
+	variables[_varIndex].value = _value;
+	for (size_t j = 1; j < variables.size(); j++)
+		if (basicVariables.count(j) && constraints[basicVariables.at(j)].data[_varIndex])
+			variables[j].value += delta * constraints[basicVariables.at(j)].data[_varIndex];
 
 }
 
-size_t SimplexWithBounds::addVariable(string _name)
+optional<size_t> LPSolver::SubProblem::firstConflictingBasicVariable() const
 {
-	m_state.variableNames.emplace_back(move(_name));
-	m_state.bounds.emplace_back();
-	solAssert(m_state.variableNames.size() == m_state.bounds.size());
-	// TODO relax in the future.
-	m_state.bounds.back().lower = 0;
-	m_assignments.emplace_back(0);
-	size_t varsBefore = m_state.variableNames.size();
-	normalizeRowLengths(m_state);
-	solAssert(m_state.variableNames.size() == varsBefore);
-	m_assignments.resize(m_state.variableNames.size());
-	solAssert(m_assignments.size() == m_state.bounds.size());
-	return m_state.variableNames.size() - 1;
-}
-
-void SimplexWithBounds::addConstraint(Constraint _constraint)
-{
-	m_state.constraints.emplace_back(move(_constraint));
-	Constraint& c = m_state.constraints.back();
-	// TODO name needed unique?
-	size_t slack = addVariable("_s" + to_string(m_state.variableNames.size()));
-	c.data.resize(m_state.variableNames.size());
-	m_basicVariables[slack] = m_state.constraints.size() - 1;
-	if (c.equality)
-		m_state.bounds.at(slack).lower = c.data[0];
-	m_state.bounds.at(slack).upper = c.data[0];
-	c.equality = true;
-	solAssert(c.data.size() > slack);
-	c.data[slack] = -1;
-	c.data[0] = 0;
-	solAssert(m_assignments.size() == m_state.bounds.size());
-}
-
-void SimplexWithBounds::update(size_t _var, rational const& _value)
-{
-	rational delta = _value - m_assignments[_var];
-	m_assignments[_var] = _value;
-	for (size_t j = 0; j < m_assignments.size(); j++)
-		if (m_basicVariables.count(j) && m_state.constraints[m_basicVariables.at(j)].data[_var])
-			m_assignments[j] += m_state.constraints[m_basicVariables.at(j)].data[_var] * delta;
-
-}
-
-optional<size_t> SimplexWithBounds::firstConflictingBasicVariable() const
-{
-	for (auto const& [i, bounds]: m_state.bounds | ranges::views::enumerate)
-		if (m_basicVariables.count(i) && (
-			(bounds.lower && m_assignments[i] < *bounds.lower) ||
-			(bounds.upper && m_assignments[i] > *bounds.upper)
-		))
+	for (auto const& varItem: basicVariables)
+	{
+		Variable const& variable = variables[varItem.first];
+		if (
+			(variable.bounds.lower && variable.value < *variable.bounds.lower) ||
+			(variable.bounds.upper && variable.value > *variable.bounds.upper)
+		)
 			return i;
+	}
 	return nullopt;
 }
 
-optional<size_t> SimplexWithBounds::firstReplacementVar(
+optional<size_t> LPSolver::SubProblem::firstReplacementVar(
 	size_t _basicVarToReplace,
 	bool _increasing
 ) const
 {
-	LinearExpression const& basicVarEquation = m_state.constraints[m_basicVariables.at(_basicVarToReplace)].data;
-	for (auto const& [i, bounds]: m_state.bounds | ranges::views::enumerate)
+	LinearExpression const& basicVarEquation = constraints[basicVariables.at(_basicVarToReplace)].data;
+	for (auto const& [i, var]: variables | ranges::views::enumerate | ranges::views::tail)
 	{
-		if (m_basicVariables.count(i) || !basicVarEquation[i])
+		if (basicVariables.count(i) || !basicVarEquation[i])
 			continue;
 		bool positive = basicVarEquation[i] > 0;
 		if (!_increasing)
 			positive = !positive;
-		if (positive && (!m_state.bounds[i].upper || m_assignments[i] < m_state.bounds[i].upper))
+		Variable const& candidate = variables[i];
+		if (positive && (!candidate.bounds.upper || candidate.value < candidate.bounds.upper))
 			return i;
-		if (!positive && (!m_state.bounds[i].lower || m_assignments[i] > m_state.bounds[i].lower))
+		if (!positive && (!candidate.bounds.lower || candidate.value > candidate.bounds.lower)
 			return i;
 	}
 	return nullopt;
 }
 
-void SimplexWithBounds::pivot(size_t _old, size_t _new)
+void LPSolver::SubProblem::pivot(size_t _old, size_t _new)
 {
 	// Transform pivotRow such that the coefficient for _new is -1
 	// Then use that to set all other coefficients for _new to zero.
-	size_t pivotRow = m_basicVariables[_old];
-	LinearExpression& pivotRowData = m_state.constraints[m_basicVariables[_old]].data;
+	size_t pivotRow = basicVariables[_old];
+	LinearExpression& pivotRowData = constraints[pivotRow].data;
 
 	rational pivot = pivotRowData[_new];
 	solAssert(pivot != 0, "");
@@ -796,572 +506,29 @@ void SimplexWithBounds::pivot(size_t _old, size_t _new)
 			_row += _row[_new] * pivotRowData;
 	};
 
-	for (size_t i = 0; i < m_state.constraints.size(); ++i)
+	for (size_t i = 0; i < constraints.size(); ++i)
 		if (i != pivotRow)
-			subtractMultipleOfPivotRow(m_state.constraints[i].data);
+			subtractMultipleOfPivotRow(constraints[i].data);
 
-	m_basicVariables.erase(_old);
-	m_basicVariables[_new] = pivotRow;
+	basicVariables.erase(_old);
+	basicVariables[_new] = pivotRow;
 }
 
-void SimplexWithBounds::pivotAndUpdate(
+void LPSolver::SubProblem::pivotAndUpdate(
 	size_t _oldBasicVar,
 	rational const& _newValue,
 	size_t _newBasicVar
 )
 {
-	rational theta = (_newValue - m_assignments[_oldBasicVar]) / m_state.constraints[m_basicVariables[_oldBasicVar]].data[_newBasicVar];
+	rational theta = (_newValue - variables[_oldBasicVar].value) / constraints[basicVariables[_oldBasicVar]].data[_newBasicVar];
 
-	m_assignments[_oldBasicVar] = _newValue;
-	m_assignments[_newBasicVar] += theta;
+	variables[_oldBasicVar].value = _newValue;
+	variables[_newBasicVar].value += theta;
 
-	for (auto const& [i, row]: m_basicVariables)
-		if (i != _oldBasicVar && m_state.constraints[row].data[_newBasicVar])
-			m_assignments[i] += m_state.constraints[row].data[_newBasicVar] * theta;
+	for (auto const& [i, row]: basicVariables)
+		if (i != _oldBasicVar && constraints[row].data[_newBasicVar])
+			variables[i].value += constraints[row].data[_newBasicVar] * theta;
 
 	pivot(_oldBasicVar, _newBasicVar);
 	//cout << "After pivot and update: " << endl << toString() << endl;
-}
-
-string SimplexWithBounds::toString() const
-{
-	string ret = "---\n" + m_state.toString();
-	for (auto const& [j, val]: m_assignments | ranges::views::enumerate)
-	{
-		ret += " " + m_state.variableNames[j];
-		if (m_basicVariables.count(j)) ret += " (b)";
-		ret += " = " + ::toString(val) + "\n";
-	}
-	ret += "------\n";
-	return ret;
-}
-
-pair<LPResult, variant<map<size_t, rational>, ReasonSet>> SolvingStateSimplifier::simplify()
-{
-	do
-	{
-		m_changed = false;
-		if (auto conflict = removeFixedVariables())
-			return {LPResult::Infeasible, move(*conflict)};
-		if (auto conflict = extractDirectConstraints())
-			return {LPResult::Infeasible, move(*conflict)};
-		// TODO we cannot do this anymore because it would
-		// mess up the variable numbering
-		// removeEmptyColumns();
-	}
-	while (m_changed);
-
-	return {LPResult::Unknown, move(m_fixedVariables)};
-}
-
-optional<ReasonSet> SolvingStateSimplifier::removeFixedVariables()
-{
-	for (auto const& [index, bounds]: m_state.bounds | ranges::views::enumerate)
-	{
-		if (!bounds.upper || (!bounds.lower && bounds.upper->numerator() > 0))
-			continue;
-		// Lower bound must be at least zero.
-		rational lower = max(rational{}, bounds.lower ? *bounds.lower : rational{});
-		rational upper = *bounds.upper;
-		if (upper < lower)
-			// Infeasible.
-			return bounds.lowerReasons + bounds.upperReasons;
-		if (upper != lower)
-			continue;
-		set<size_t> reasons = bounds.lowerReasons + bounds.upperReasons;
-		m_fixedVariables[index] = lower;
-		//cout << "Fixed " << m_state.variableNames.at(index) << " to " << ::toString(lower) << endl;
-		m_state.bounds[index] = {};
-		m_changed = true;
-
-		// substitute variable
-		// -> add the bounds to the literals for the conflict
-		// (maybe only if one of these constraints is used)
-		for (Constraint& constraint: m_state.constraints)
-			if (constraint.data[index])
-			{
-				constraint.data[0] -= constraint.data[index] * lower;
-				constraint.data[index] = 0;
-				constraint.reasons += reasons;
-			}
-	}
-
-	return nullopt;
-}
-
-optional<ReasonSet> SolvingStateSimplifier::extractDirectConstraints()
-{
-	vector<bool> constraintsToRemove(m_state.constraints.size(), false);
-	bool needsRemoval = false;
-	for (auto const& [index, constraint]: m_state.constraints | ranges::views::enumerate)
-	{
-		auto nonzeroCoefficients = constraint.data.enumerateTail() | ranges::views::filter(
-			[](std::pair<size_t, rational> const& _x) { return !!_x.second; }
-		);
-		// TODO we can exit early on in the loop above since we only care about zero, one or more than one nonzero entries.
-		// TODO could also use iterators and exit if we can advance it twice.
-		auto numNonzero = ranges::distance(nonzeroCoefficients);
-		if (numNonzero > 1)
-			continue;
-		constraintsToRemove[index] = true;
-		needsRemoval = true;
-		if (numNonzero == 0)
-		{
-			// 0 <= b or 0 = b
-			if (
-				constraint.data.front().numerator() < 0 ||
-				(constraint.equality && constraint.data.front())
-			)
-				return constraint.reasons;
-		}
-		else
-		{
-			auto&& [varIndex, factor] = nonzeroCoefficients.front();
-			// a * x <= b
-			rational bound = constraint.data[0] / factor;
-			if (
-				(factor >= 0 || constraint.equality) &&
-				(!m_state.bounds[varIndex].upper || bound < m_state.bounds[varIndex].upper)
-			)
-			{
-				m_state.bounds[varIndex].upper = bound;
-				m_state.bounds[varIndex].upperReasons = constraint.reasons;
-			}
-			if (
-				(factor <= 0 || constraint.equality) &&
-				bound >= 0 &&
-				(!m_state.bounds[varIndex].lower || bound > m_state.bounds[varIndex].lower)
-			)
-			{
-				m_state.bounds[varIndex].lower = bound;
-				m_state.bounds[varIndex].lowerReasons = constraint.reasons;
-			}
-		}
-	}
-	if (needsRemoval)
-	{
-		m_changed = true;
-		eraseIndices(m_state.constraints, constraintsToRemove);
-	}
-	return nullopt;
-}
-
-void SolvingStateSimplifier::removeEmptyColumns()
-{
-	vector<bool> variablesSeen(m_state.bounds.size(), false);
-	for (auto const& constraint: m_state.constraints)
-	{
-		for (auto&& [index, factor]: constraint.data.enumerateTail())
-			if (factor)
-				variablesSeen[index] = true;
-	}
-
-	vector<bool> variablesToRemove(variablesSeen.size(), false);
-	bool needsRemoval = false;
-	for (auto&& [i, seen]: variablesSeen | ranges::views::enumerate | ranges::views::tail)
-		if (!seen)
-		{
-			variablesToRemove[i] = true;
-			needsRemoval = true;
-			SolvingState::Bounds const& bounds = m_state.bounds.at(i);
-			// TODO actually it is unbounded if m_state.bounds.at(i).upper is nullopt.
-			if (bounds.lower || bounds.upper)
-			{
-				solAssert(!bounds.upper || bounds.upper >= 0);
-				if (bounds.lower && bounds.upper)
-					solAssert(*bounds.lower <= *bounds.upper);
-				m_fixedVariables[i] =
-					bounds.upper ?
-					*bounds.upper :
-					*bounds.lower;
-			}
-		}
-	if (needsRemoval)
-	{
-		m_changed = true;
-		removeColumns(m_state, variablesToRemove);
-	}
-}
-
-ProblemSplitter::ProblemSplitter(const SolvingState& _state):
-	m_state(_state),
-	m_column(1),
-	m_seenColumns(std::vector<bool>(m_state.variableNames.size(), false))
-{
-	while (m_column < m_state.variableNames.size() && nonZeroEntriesInColumn(_state, m_column).empty())
-		m_column++;
-}
-
-pair<vector<bool>, vector<bool>> ProblemSplitter::next()
-{
-	vector<bool> includedColumns;
-	vector<bool> includedRows;
-	tie(includedColumns, includedRows) = connectedComponent(m_state, m_column);
-
-	// Update state.
-	m_seenColumns |= includedColumns;
-	++m_column;
-	while (m_column < m_state.variableNames.size() && (
-		m_seenColumns[m_column] ||
-		nonZeroEntriesInColumn(m_state, m_column).empty()
-	))
-		++m_column;
-
-	return {move(includedColumns), move(includedRows)};
-/*
-	SolvingState splitOff;
-
-	splitOff.variableNames.emplace_back();
-	splitOff.bounds.emplace_back();
-
-	for (auto&& [i, included]: includedColumns | ranges::views::enumerate | ranges::views::tail)
-		if (included)
-		{
-			splitOff.variableNames.emplace_back(move(m_state.variableNames[i]));
-			splitOff.bounds.emplace_back(move(m_state.bounds[i]));
-		}
-
-	for (auto&& [i, included]: includedRows | ranges::views::enumerate)
-		if (included)
-		{
-			// Use const& on purpose because moving from the state can lead
-			// to undefined behaviour for connectedComponent
-			Constraint const& constraint = m_state.constraints[i];
-			Constraint splitRow{{}, constraint.equality, constraint.reasons};
-			for (size_t j = 0; j < constraint.data.size(); j++)
-				if (j == 0 || includedColumns[j])
-					splitRow.data.push_back(constraint.data[j]);
-			splitOff.constraints.push_back(move(splitRow));
-		}
-
-	return {includedColumns, splitOff};
-	*/
-}
-
-LPSolver::LPSolver(bool)
-{
-}
-
-LPResult LPSolver::setState(SolvingState _state)
-{
-	//cout << "Set state:\n" << _state.toString() << endl;
-	m_state = make_shared<SolvingState>(move(_state));
-	m_subProblems.clear();
-	m_subProblemsPerVariable.resize(m_state->variableNames.size(), static_cast<size_t>(-1));
-	m_subProblemsPerConstraint.resize(m_state->constraints.size(), static_cast<size_t>(-1));
-
-	normalizeRowLengths(*m_state);
-	auto&& [result, modelOrReasonSet] = SolvingStateSimplifier(*m_state).simplify();
-	if (result == LPResult::Infeasible)
-		return result;
-
-	// We do not need to store reasons because at this point, we do not have any reasons yet.
-	// We can add this and just need to store the reasons together with the variables.
-	m_fixedVariables = make_shared<std::map<size_t, rational>>(std::get<std::map<size_t, rational>>(modelOrReasonSet));
-
-	//cout << "Splitting..." << endl;
-	ProblemSplitter splitter(*m_state);
-	while (splitter)
-	{
-		auto&& [variables, constraints] = splitter.next();
-		SubProblem& problem = *m_subProblems.emplace_back(make_shared<SubProblem>());
-		solAssert(problem.dirty);
-		for (auto&& [i, included]: variables | ranges::views::enumerate)
-			if (included)
-			{
-				m_subProblemsPerVariable[i] = m_subProblems.size() - 1;
-				problem.variables.emplace(i);
-			}
-		for (auto&& [i, included]: constraints | ranges::views::enumerate)
-			if (included)
-				m_subProblemsPerConstraint[i] = m_subProblems.size() - 1;
-		//cout << "Adding new sub problem with " << m_subProblems.back()->variables.size() << " vars and " << m_subProblems.back()->constraints.size() << " constraints\n" << endl;
-		//cout << "-------------------- Split out" << endl;
-		//cout << m_subProblems.back()->state.toString() << endl;
-	}
-	//cout << "Done splitting." << endl;
-	return LPResult::Unknown;
-}
-
-void LPSolver::addConstraint(Constraint _constraint)
-{
-	//cout << "Adding constraint " << endl;
-	set<size_t> touchedProblems;
-	for (auto const& [index, entry]: _constraint.data.enumerateTail())
-		if (entry)
-		{
-			if (m_fixedVariables->count(index))
-			{
-				// This can directly lead to a conflict. We will check it later during the
-				// simplify run on the split problems.
-				_constraint.data[0] -= _constraint.data[index] * m_fixedVariables->at(index);
-				_constraint.data[index] = {};
-			}
-			else if (m_subProblemsPerVariable[index] != static_cast<size_t>(-1))
-				touchedProblems.emplace(m_subProblemsPerVariable[index]);
-		}
-	if (touchedProblems.empty())
-	{
-		//cout << "Creating new sub problem." << endl;
-		// TODO we could find an empty spot for the pointer.
-		m_subProblems.emplace_back(make_shared<SubProblem>());
-		solAssert(m_subProblems.back()->dirty);
-		touchedProblems.emplace(m_subProblems.size() - 1);
-	}
-	for (size_t problemToErase: touchedProblems | ranges::views::tail | ranges::views::reverse)
-		combineSubProblems(*touchedProblems.begin(), problemToErase);
-	addConstraintToSubProblem(*touchedProblems.begin(), _constraint);
-//	cout << "subproblems: " << (
-//		m_subProblems | ranges::views::transform([&](auto&& p) { return !!p; })).size() <<
-//		" (total: " << m_subProblems.size() << endl;
-	//cout << "done" << endl;
-}
-
-pair<LPResult, variant<Model, ReasonSet>> LPSolver::check()
-{
-	//cout << "Checking" << endl;
-	for (auto&& [index, problem]: m_subProblems | ranges::views::enumerate)
-	{
-		if (!problem)
-			continue;
-		if (!problem->dirty)
-		{
-			solAssert(problem->result != LPResult::Infeasible);
-			continue;
-		}
-
-		//cout << "Updating sub problem" << endl;
-
-		if (!problem->simplex)
-		{
-			auto&& [state, varMapping] = stateFromSubProblem(index);
-			problem->varMapping = move(varMapping);
-
-			// TODO if we do not use simplify, but just iteratively add constraints and bounsd
-			// to the simplex, we can detect "direct constraints" while adding (and compressing).
-			// and we might also be able to remove fixed variables.
-
-			// The simplify run is important because it detects conflicts
-			// due to fixed variables.
-			auto&& [result, modelOrReasonSet] = SolvingStateSimplifier{state}.simplify();
-			if (result == LPResult::Infeasible)
-			{
-				problem->result = LPResult::Infeasible;
-				problem->model = {};
-				problem->dirty = false;
-				// TODO we could use the improved reason set above.
-				return {LPResult::Infeasible, reasonSetForSubProblem(*problem)};
-			}
-			for (auto&& [fixedVar, value]: get<map<size_t, rational>>(modelOrReasonSet))
-			{
-				state.bounds.at(fixedVar).lower = value;
-				state.bounds.at(fixedVar).upper = value;
-			}
-
-			normalizeRowLengths(state);
-			problem->simplex = SimplexWithBounds{state};
-		}
-
-		// TODO we can just set the fixed variables to fixed bounds.
-		// Then adding new constraints using those is still fine.
-
-		//cout << state.toString() << endl;
-
-		// This is the new algorithm that uses bounds directly.
-		// TODO This new algorithm also allows us to lift the restriction
-		// that variables need to be non-negative.
-				/*
-		bool useSimplexWithBounds = true;
-		if (useSimplexWithBounds)
-		{*/
-			optional<LPResult> result;
-/*			if (m_cache)
-			{
-				auto it = m_cache->find(state);
-				if (it != m_cache->end())
-				{
-					//cout << "Cache hit" << endl;
-					result = it->second;
-				}
-			}*/
-			if (!result)
-			{
-				*result = problem->simplex->check();
-				// TODO we should even keep the updated tableau in the subproblem
-/*				if (m_cache)
-				{
-					(*m_cache)[state] = *result;
-					//cout << "Cache size " << m_cache->size() << endl;
-				}*/
-			}
-			problem->dirty = false;
-			problem->result = *result;
-			if (problem->result == LPResult::Infeasible)
-				return {LPResult::Infeasible, reasonSetForSubProblem(*problem)};
-		/*}
-		else if (auto conflict = boundsToConstraints(state))
-		{
-			problem->result = LPResult::Infeasible;
-			problem->model = {};
-			problem->dirty = false;
-			return {LPResult::Infeasible, reasonSetForSubProblem(*problem)};
-		}
-		else if (state.constraints.empty())
-		{
-			problem->result = LPResult::Feasible;
-			problem->model = {};
-			problem->dirty = false;
-		}
-		else
-		{
-			optional<LPResult> result;
-			if (m_cache)
-			{
-				auto it = m_cache->find(state);
-				if (it != m_cache->end())
-				{
-					//cout << "Cache hit" << endl;
-					result = it->second;
-				}
-			}
-			if (!result)
-			{
-				LinearExpression objectives;
-				objectives.resize(1);
-				objectives.resize(state.variableNames.size(), rational(bigint(1)));
-				// TODO the model relies on the variable numbering.
-				result = LPResult::Unknown;
-				tie(*result, problem->model) = simplex(state.constraints, move(objectives));
-				if (m_cache)
-				{
-					(*m_cache)[state] = *result;
-					//cout << "Cache size " << m_cache->size() << endl;
-				}
-			}
-			problem->dirty = false;
-			problem->result = *result;
-			if (problem->result == LPResult::Infeasible)
-				return {LPResult::Infeasible, reasonSetForSubProblem(*problem)};
-		}*/
-	}
-
-	return {LPResult::Unknown, Model{}};
-}
-
-void LPSolver::combineSubProblems(size_t _combineInto, size_t _combineFrom)
-{
-	//cout << "Combining " << _combineInto << " <- " << _combineFrom << endl;
-	// TOOD creating a copy and setting dirty is on operation.
-	m_subProblems[_combineInto] = make_shared<SubProblem>(*m_subProblems[_combineInto]);
-	m_subProblems[_combineInto]->dirty = true;
-	m_subProblems[_combineInto]->simplex = nullopt;
-	m_subProblems[_combineInto]->varMapping = {};
-
-	for (size_t& item: m_subProblemsPerVariable)
-		if (item == _combineFrom)
-			item = _combineInto;
-	for (size_t& item: m_subProblemsPerConstraint)
-		if (item == _combineFrom)
-			item = _combineInto;
-	m_subProblems[_combineInto]->variables += move(m_subProblems[_combineFrom]->variables);
-
-	m_subProblems[_combineFrom].reset();
-}
-
-void LPSolver::addConstraintToSubProblem(size_t _subProblem, Constraint _constraint)
-{
-	// TODO This is called in a loop - maybe we shouldn't copy every time.
-	m_subProblems[_subProblem] = make_shared<SubProblem>(*m_subProblems[_subProblem]);
-	SubProblem& problem = *m_subProblems[_subProblem];
-	problem.dirty = true;
-	if (problem.simplex)
-	{
-		Constraint compressedConstraint(_constraint);
-		compressedConstraint.data.resize(1, _constraint.data[0]);
-		for (auto const& [index, entry]: _constraint.data.enumerateTail())
-			if (entry)
-			{
-				size_t cIndex = 0;
-				if (problem.varMapping.count(index))
-				{
-					cIndex = problem.varMapping.at(index);
-					solAssert(m_subProblemsPerVariable.at(index) == _subProblem);
-				}
-				else
-				{
-					cIndex = problem.simplex->addVariable(m_state->variableNames.at(index));
-					problem.varMapping[index] = cIndex;
-					problem.variables.emplace(index);
-					solAssert(m_subProblemsPerVariable.at(index) == static_cast<size_t>(-1));
-					m_subProblemsPerVariable[index] = _subProblem;
-				}
-				solAssert(cIndex >= compressedConstraint.data.size());
-				compressedConstraint.data.resize(cIndex + 1);
-				compressedConstraint.data[cIndex] = entry;
-			}
-		problem.simplex->addConstraint(move(compressedConstraint));
-	}
-	else
-	{
-		problem.simplex = nullopt;
-		problem.varMapping = {};
-
-		for (auto const& [index, entry]: _constraint.data.enumerateTail())
-			if (entry)
-			{
-				solAssert(m_subProblemsPerVariable[index] == static_cast<size_t>(-1) || m_subProblemsPerVariable[index] == _subProblem);
-				m_subProblemsPerVariable[index] = _subProblem;
-				problem.variables.emplace(index);
-			}
-	}
-
-	problem.removableConstraints.emplace_back(move(_constraint));
-}
-
-pair<SolvingState, map<size_t, size_t>> LPSolver::stateFromSubProblem(size_t _index) const
-{
-	SolvingState split;
-	map<size_t, size_t> varMapping;
-
-	split.variableNames.emplace_back();
-	split.bounds.emplace_back();
-
-	SubProblem const& problem = *m_subProblems[_index];
-	for (size_t varIndex: problem.variables)
-	{
-		varMapping[varIndex] = split.variableNames.size();
-		split.variableNames.emplace_back(m_state->variableNames[varIndex]);
-		split.bounds.emplace_back(m_state->bounds[varIndex]);
-	}
-	for (auto&& item: m_subProblemsPerConstraint | ranges::views::enumerate)
-		if (item.second == _index)
-		{
-			Constraint const& constraint = m_state->constraints[item.first];
-			Constraint splitRow{{}, constraint.equality, constraint.reasons};
-			splitRow.data.push_back(constraint.data.get(0));
-			for (size_t varIndex: problem.variables)
-				splitRow.data.push_back(constraint.data.get(varIndex));
-			split.constraints.push_back(move(splitRow));
-		}
-
-	for (Constraint const& constraint: m_subProblems[_index]->removableConstraints)
-	{
-		Constraint splitRow{{}, constraint.equality, constraint.reasons};
-		splitRow.data.push_back(constraint.data.get(0));
-		for (size_t varIndex: problem.variables)
-			splitRow.data.push_back(constraint.data.get(varIndex));
-		split.constraints.push_back(move(splitRow));
-	}
-
-	normalizeRowLengths(split);
-
-	return {split, varMapping};
-}
-
-ReasonSet LPSolver::reasonSetForSubProblem(LPSolver::SubProblem const& _subProblem)
-{
-	ReasonSet reasons;
-	for (Constraint const& c: _subProblem.removableConstraints)
-		reasons += c.reasons;
-	return reasons;
 }

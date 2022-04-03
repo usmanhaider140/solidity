@@ -42,8 +42,6 @@ struct Constraint
 {
 	LinearExpression data;
 	bool equality = false;
-	/// Set of literals the conjunction of which implies this constraint.
-	std::set<size_t> reasons = {};
 
 	bool operator<(Constraint const& _other) const;
 	bool operator==(Constraint const& _other) const;
@@ -171,101 +169,6 @@ enum class LPResult
 	Infeasible ///< System does not have any solution.
 };
 
-
-class SimplexWithBounds
-{
-public:
-	explicit SimplexWithBounds(SolvingState _state);
-	LPResult check();
-
-	size_t addVariable(std::string _name);
-	void addConstraint(Constraint _constraint);
-
-	std::string toString() const;
-private:
-	/// Set value of non-basic variable.
-	void update(size_t _var, rational const& _value);
-	/// @returns the index of the first basic variable violating its bounds.
-	std::optional<size_t> firstConflictingBasicVariable() const;
-	std::optional<size_t> firstReplacementVar(size_t _basicVarToReplace, bool _increasing) const;
-
-	void pivot(size_t _old, size_t _new);
-	void pivotAndUpdate(size_t _oldBasicVar, rational const& _newValue, size_t _newBasicVar);
-
-	SolvingState m_state;
-	std::vector<rational> m_assignments;
-	/// Variable index to row it controls.
-	std::map<size_t, size_t> m_basicVariables;
-};
-
-
-/**
- * Applies several strategies to simplify a given solving state.
- * During these simplifications, it can sometimes already be determined if the
- * state is feasible or not.
- * Since some variables can be fixed to specific values, it returns a
- * (partial) model.
- *
- * - Constraints with exactly one nonzero coefficient represent "a x <= b"
- *   and thus are turned into bounds.
- * - Constraints with zero nonzero coefficients are constant relations.
- *   If such a relation is false, answer "infeasible", otherwise remove the constraint.
- * - Empty columns can be removed.
- * - Variables with matching bounds can be removed from the problem by substitution.
- *
- * Holds a reference to the solving state that is modified during operation.
- */
-class SolvingStateSimplifier
-{
-public:
-	SolvingStateSimplifier(SolvingState& _state):
-		m_state(_state) {}
-
-	std::pair<LPResult, std::variant<std::map<size_t, rational>, ReasonSet>> simplify();
-
-private:
-	/// Remove variables that have equal lower and upper bound.
-	/// @returns reason / set of conflicting clauses if infeasible.
-	std::optional<ReasonSet> removeFixedVariables();
-
-	/// Removes constraints of the form 0 <= b or 0 == b (no variables) and
-	/// turns constraints of the form a * x <= b (one variable) into bounds.
-	/// @returns reason / set of conflicting clauses if infeasible.
-	std::optional<ReasonSet> extractDirectConstraints();
-
-	/// Removes all-zeros columns.
-	void removeEmptyColumns();
-
-	/// Set to true by the strategies if they performed some changes.
-	bool m_changed = false;
-
-	SolvingState& m_state;
-	std::map<size_t, rational> m_fixedVariables;
-};
-
-/**
- * Splits a given linear program into multiple linear programs with disjoint sets of variables.
- * The initial program is feasible if and only if all sub-programs are feasible.
- */
-class ProblemSplitter
-{
-public:
-	explicit ProblemSplitter(SolvingState const& _state);
-
-	/// @returns true if there are still sub-problems to split out.
-	operator bool() const { return m_column < m_state.variableNames.size(); }
-
-	/// @returns the next sub-problem.
-	std::pair<std::vector<bool>, std::vector<bool>> next();
-
-private:
-	SolvingState const& m_state;
-	/// Next column to start the search for a connected component.
-	size_t m_column = 1;
-	/// The columns we have already split out.
-	std::vector<bool> m_seenColumns;
-};
-
 /**
  * LP solver for rational problems.
  *
@@ -280,47 +183,62 @@ private:
 class LPSolver
 {
 public:
-	explicit LPSolver(bool _supportModels = true);
-	explicit LPSolver(std::unordered_map<SolvingState, LPResult>* _cache):
-		m_cache(_cache) {}
+	void addConstraint(Constraint const& _constraint, std::optional<size_t> _reason = std::nullopt);
+	void setVariableName(size_t _variable, std::string _name);
+	void addLowerBound(size_t _variable, rational _bound);
+	void addUpperBound(size_t _variable, rational _bound);
 
-
-	LPResult setState(SolvingState _state);
-	void addConstraint(Constraint _constraint);
 	std::pair<LPResult, std::variant<Model, ReasonSet>> check();
 
 private:
+	SubProblem& unseal(size_t _problem);
 	void combineSubProblems(size_t _combineInto, size_t _combineFrom);
-	void addConstraintToSubProblem(size_t _subProblem, Constraint _constraint);
-	void updateSubProblems();
+	void addConstraintToSubProblem(size_t _subProblem, Constraint const& _constraint, std::optional<size_t> _reason);
+	void addOuterVariableToSubProblem(size_t _subProblem, size_t _outerIndex);
+	size_t addNewVariableToSubProblem(size_t _subProblem);
 
-	/// Ground state for CDCL. This is shared by copies of the solver.
-	/// Only ``setState`` changes the state. Copies will only use
-	/// ``addConstraint`` which does not change m_state.
-	std::shared_ptr<SolvingState> m_state;
+	std::map<std::string, rational> model() const;
+
+	struct Bounds
+	{
+		std::optional<rational> lower;
+		std::optional<rational> upper;
+	};
+	struct Variable
+	{
+		std::string name = {};
+		rational value = 0;
+		Bounds bounds = {};
+	};
 	struct SubProblem
 	{
-		// TODO now we could actually put the constraints here again.
-		std::vector<Constraint> removableConstraints;
-		bool dirty = true;
-		LPResult result = LPResult::Unknown;
-		std::vector<boost::rational<bigint>> model = {};
-		std::set<size_t> variables = {};
-		std::optional<SimplexWithBounds> simplex = std::nullopt;
+		/// Set to true on "check". Needs a copy for adding a constraint or bound if set to true.
+		bool sealed = false;
+		std::optional<LPResult> result = std::nullopt;
+		std::vector<Constraint> constraints;
+		std::vector<Variable> variables = std::vector<Variable>(1, {});
+		/// Variable index to constraint it controls.
+		std::map<size_t, size_t> basicVariables;
+		/// Maps outer indices to inner indices.
 		std::map<size_t, size_t> varMapping = {};
+		std::set<size_t> reasons;
+
+	private:
+		LPResult check();
+		/// Set value of non-basic variable.
+		void update(size_t _varIndex, rational const& _value);
+		/// @returns the index of the first basic variable violating its bounds.
+		std::optional<size_t> firstConflictingBasicVariable() const;
+		std::optional<size_t> firstReplacementVar(size_t _basicVarToReplace, bool _increasing) const;
+
+		void pivot(size_t _old, size_t _new);
+		void pivotAndUpdate(size_t _oldBasicVar, rational const& _newValue, size_t _newBasicVar);
 	};
 
-	std::pair<SolvingState, std::map<size_t, size_t>> stateFromSubProblem(size_t _index) const;
-	ReasonSet reasonSetForSubProblem(SubProblem const& _subProblem);
-
-	std::shared_ptr<std::map<size_t, rational>> m_fixedVariables;
 	/// These use "copy on write".
 	std::vector<std::shared_ptr<SubProblem>> m_subProblems;
-	std::vector<size_t> m_subProblemsPerVariable;
-	std::vector<size_t> m_subProblemsPerConstraint;
-	/// TODO also store the first infeasible subproblem?
-	/// TODO still retain the cache?
-	std::unordered_map<SolvingState, LPResult>* m_cache = nullptr;
+	/// Maps outer indices to sub problems.
+	std::map<size_t, size_t> m_subProblemsPerVariable;
 
 };
 
