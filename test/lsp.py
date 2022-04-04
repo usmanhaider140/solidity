@@ -110,6 +110,14 @@ class JsonRpcProcess:
         self.async_read_loop()
         return self
 
+    def clear_received_messages(self, num: 100, block: bool = False):
+        for _ in range(num):
+            try:
+                self.read_message(False, block)
+            except:
+                return
+
+
     # Reads a message without blocking
     def read_message(self, peek: bool = False, block: bool = True):
 #        print("read_message(" + str(peek) + ", " + str(block))
@@ -296,16 +304,29 @@ class TestParser:
         "method, request, response, responseBegin, responseEnd",
         defaults=(None, None, None, None)
     )
-    Diagnostics = namedtuple('Diagnostics', 'tests start end')
+    Diagnostics = namedtuple('Diagnostics', 'tests start end has_header')
     Diagnostic = namedtuple('Diagnostic', 'marker code')
 
-    def __init__(self, content):
-        testDefStartIdx = content.find("// ----")
+    TEST_START = "// ----"
 
-        self.lines = islice(countIndex(content[testDefStartIdx:].splitlines(), testDefStartIdx), 1, None)
-        self.nextLine()
+    def __init__(self, content: str):
+        self.content = content
 
     def parse(self):
+        testDefStartIdx = self.content.rfind(self.TEST_START)
+
+        if testDefStartIdx == -1:
+            # Set start/end to end of file if there is no test section
+            yield self.Diagnostics({}, len(self.content), len(self.content), False)
+            return
+
+        self.lines = islice(
+            countIndex(self.content[testDefStartIdx:].splitlines(), testDefStartIdx),
+            1,
+            None
+        )
+        self.nextLine()
+
         yield self.parseDiagnostics()
 
         while self.currentLine is not None:
@@ -314,16 +335,14 @@ class TestParser:
 
 
     def parseDiagnostics(self):
-        diagnostics = { "tests": {} }
+        diagnostics = { "tests": {}, "has_header": True }
 
-        if self.currentLine is not None:
-            diagnostics["start"] = self.position()
+        diagnostics["start"] = self.position()
 
         while self.currentLine is not None:
             print(self.currentLine)
             fileDiagMatch = TEST_REGEXES.fileDiagnostics.match(self.line())
             if fileDiagMatch is None:
-                diagnostics["end"] = self.position()
                 break
 
             testDiagnostics = []
@@ -338,6 +357,7 @@ class TestParser:
 
             self.nextLine()
 
+        diagnostics["end"] = self.position()
         return self.Diagnostics(**diagnostics)
 
 
@@ -407,7 +427,176 @@ class TestParser:
 
     # Returns current byte position
     def position(self):
+        if self.currentLine is None:
+            return len(self.content)
         return self.currentLine[0]
+
+class FileTestRunner:
+    def __init__(self, test_name, solc, suite):
+        self.test_name = test_name
+        self.suite = suite
+        self.solc = solc
+        self.open_tests = []
+
+    def test_diagnostics(self):
+        try:
+            self.content = self.suite.get_test_file_contents(self.test_name)
+            self.markers = self.suite.get_file_tags(self.test_name)
+            self.parsedTestcases = TestParser(self.content).parse()
+
+            # Process diagnostics first
+            self.expected_diagnostics = next(self.parsedTestcases)
+            assert isinstance(self.expected_diagnostics, TestParser.Diagnostics) is True
+
+            tests = self.expected_diagnostics.tests
+
+            # Add our own test diagnostics if they didn't exist
+            if self.test_name not in tests:
+                tests[self.test_name] = []
+
+
+            published_diagnostics = \
+                self.suite.open_file_and_wait_for_diagnostics(self.solc, self.test_name, len(tests))
+            for diagnostics in published_diagnostics:
+                self.open_tests.append(diagnostics["uri"].replace(self.suite.project_root_uri + "/", "")[:-len(".sol")])
+
+            self.suite.expect_equal(
+                len(published_diagnostics),
+                len(tests),
+                "Amount of reports does not match!")
+
+            for diagnostics in published_diagnostics:
+                testname = diagnostics["uri"].replace(self.suite.project_root_uri + "/", "")[:-len(".sol")]
+
+                expected_diagnostics = tests[testname]
+                self.suite.expect_equal(
+                    len(diagnostics["diagnostics"]),
+                    len(expected_diagnostics),
+                    "Unexpected amount of diagnostics"
+                )
+                lMarkers = self.suite.get_file_tags(testname)
+                for diagnostic in diagnostics["diagnostics"]:
+                    expected_diagnostic = next((x for x in
+                        expected_diagnostics if diagnostic['range'] ==
+                        lMarkers[x.marker]), None)
+
+                    if expected_diagnostic is None:
+                        raise ExpectationFailed(
+                            f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
+
+                    #import pdb; pdb.set_trace()
+                    self.suite.expect_diagnostic(
+                        diagnostic,
+                        code=expected_diagnostic.code,
+                        marker=lMarkers[expected_diagnostic.marker]
+                    )
+
+            return True
+        except:
+            self.close_open_files()
+            raise
+
+    def close_open_files(self):
+        for test in self.open_tests:
+            self.solc.send_message(
+                'textDocument/didClose',
+                { 'textDocument': { 'uri': self.suite.get_test_file_uri(test) }}
+            )
+
+        self.solc.clear_received_messages(len(self.open_tests), True)
+        self.open_tests.clear()
+
+    def test_methods(self):
+        try:
+            # Now handle each request/response pair in the test definition
+            for testcase in self.parsedTestcases:
+
+                requestBodyJson = self.parse_json_with_tags(testcase.request, self.markers)
+                # add textDocument/uri if missing
+                if 'textDocument' not in requestBodyJson:
+                    requestBodyJson['textDocument'] = { 'uri': self.suite.get_test_file_uri(self.test_name) }
+                actualResponseJson = self.solc.call_method(testcase.method, requestBodyJson)
+
+                #print(actualResponseJson)
+                if "method" in actualResponseJson and \
+                    actualResponseJson["method"] == "textDocument/publishDiagnostics":
+                    raise ExpectationFailed(
+                        f'Received more diagnostics than expected: \n{json.dumps(actualResponseJson["params"], indent=4, sort_keys=True)}')
+
+                for result in actualResponseJson["result"]:
+                    result["uri"] = result["uri"].replace(self.suite.project_root_uri + "/", "")
+
+                try:
+                    expectedResponseJson = self.parse_json_with_tags(testcase.response, self.markers)
+                except json.decoder.JSONDecodeError:
+                    expectedResponseJson = None
+
+
+                if expectedResponseJson != actualResponseJson:
+                    print("Request failed: \n" + testcase.request)
+                    actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
+
+                    if expectedResponseJson is None:
+                        print("Failed to parse expected response, received: \n" + actualResponsePretty)
+                    else:
+                        print("Expected:\n" + \
+                            self.replace_ranges_with_tags(expectedResponseJson) + \
+                            "\nbut got:\n" + actualResponsePretty
+                        )
+                    print("(u)pdate/(r)etry/(i)gnore?")
+                    userResponse = sys.stdin.read(1)
+                    if userResponse == "u":
+                        self.content = self.content[:testcase.responseBegin] + \
+                            precedeComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
+                            self.content[testcase.responseEnd:]
+
+                        with open(self.get_test_file_path(self.test_name), mode="w", encoding="utf-8", newline='') as f:
+                            f.write(self.content)
+                    elif userResponse == "r":
+                        return False
+                    elif userResponse == "i":
+                        continue
+                    else:
+                        return False
+
+            return True
+        except TestParserException as e:
+            print(e)
+            print(e.result)
+            raise
+        finally:
+            self.close_open_files()
+
+
+    def parse_json_with_tags(self, content, markersFallback):
+        splitted = TEST_REGEXES.findTag.split(content)
+
+        # add quotes so we can parse it as json
+        contentReplaced = '"'.join(splitted)
+        contentJson = json.loads(contentReplaced)
+
+        def replace_tag(data, markers):
+            # Check if we need markers from a specific file
+            if "uri" in data:
+                markers = self.suite.get_file_tags(data["uri"][:-len(".sol")])
+
+            for key, val in data.items():
+                if key == "range":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange
+                elif key == "position":
+                    for tag, tagRange in markers.items():
+                        if tag == val:
+                            data[key] = tagRange["start"]
+                elif isinstance(val, dict):
+                    replace_tag(val, markers)
+                elif isinstance(val, list):
+                    for el in val:
+                        replace_tag(el, markers)
+            return data
+
+        return replace_tag(contentJson, markersFallback)
 
 
 class SolidityLSPTestSuite: # {{{
@@ -584,10 +773,18 @@ class SolidityLSPTestSuite: # {{{
 
         return expectations
 
-    def update_diagnostics_in_file(self, solc: JsonRpcProcess, test, content, diagStart, diagEnd):
-        content = content[:diagStart] + \
+    def update_diagnostics_in_file(
+        self,
+        solc: JsonRpcProcess,
+        test,
+        content,
+        current_diagnostics:
+        TestParser.Diagnostics
+    ):
+        content = content[:current_diagnostics.start] + \
+            ("" if current_diagnostics.has_header else f"{TestParser.TEST_START}\n") + \
             self.fetch_and_format_diagnostics(solc, test) + \
-            content[diagEnd:]
+            content[current_diagnostics.end:]
 
         with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
             f.write(content)
@@ -708,36 +905,6 @@ class SolidityLSPTestSuite: # {{{
         self.expect_equal(len(response['result']), 1, message)
         self.expect_location(response['result'][0], expected_uri, expected_lineNo, expected_startEndColumns)
 
-    def parse_json_with_tags(self, content, markersFallback):
-        splitted = TEST_REGEXES.findTag.split(content)
-
-        # add quotes so we can parse it as json
-        contentReplaced = '"'.join(splitted)
-        contentJson = json.loads(contentReplaced)
-
-        def replace_tag(data, markers):
-            # Check if we need markers from a specific file
-            if "uri" in data:
-                markers = self.get_file_tags(data["uri"][:-len(".sol")])
-
-            for key, val in data.items():
-                if key == "range":
-                    for tag, tagRange in markers.items():
-                        if tag == val:
-                            data[key] = tagRange
-                elif key == "position":
-                    for tag, tagRange in markers.items():
-                        if tag == val:
-                            data[key] = tagRange["start"]
-                elif isinstance(val, dict):
-                    replace_tag(val, markers)
-                elif isinstance(val, list):
-                    for el in val:
-                        replace_tag(el, markers)
-            return data
-
-        return replace_tag(contentJson, markersFallback)
-
 
     def find_tag_with_range(self, test, target_range):
         markers = self.get_file_tags(test)
@@ -763,13 +930,13 @@ class SolidityLSPTestSuite: # {{{
         # remove the quotes and return result
         return "".join(map(lambda p: p[1:-1] if p.startswith('"@') else p, splitted))
 
-    def userInteractionFailedDiagnostics(self, solc: JsonRpcProcess, test, content, start, end):
+    def userInteractionFailedDiagnostics(self, solc: JsonRpcProcess, test, content, current_diagnostics: TestParser.Diagnostics):
         print("(u)pdate/(r)etry/(i)gnore?")
         userResponse = sys.stdin.read(1)
         if userResponse == "u":
             while True:
                 try:
-                    content = self.update_diagnostics_in_file(solc, test, content, start, end)
+                    self.update_diagnostics_in_file(solc, test, content, current_diagnostics)
                     break
                 except Exception as e:
                     print(e)
@@ -791,23 +958,6 @@ class SolidityLSPTestSuite: # {{{
     # }}}
 
     # {{{ actual tests
-    def test_publish_diagnostics_warnings(self, solc: JsonRpcProcess) -> None:
-        self.setup_lsp(solc)
-        TEST_NAME = 'publish_diagnostics_1'
-        published_diagnostics = self.open_file_and_wait_for_diagnostics(solc, TEST_NAME)
-
-        self.expect_equal(len(published_diagnostics), 1, "One published_diagnostics message")
-        report = published_diagnostics[0]
-
-        self.expect_equal(report['uri'], self.get_test_file_uri(TEST_NAME), "Correct file URI")
-        diagnostics = report['diagnostics']
-
-        markers = self.get_file_tags(TEST_NAME)
-
-        self.expect_equal(len(diagnostics), 3, "3 diagnostic messages")
-        self.expect_diagnostic(diagnostics[0], code=6321, marker=markers["@unusedReturnVariable"])
-        self.expect_diagnostic(diagnostics[1], code=2072, marker=markers["@unusedVariable"])
-        self.expect_diagnostic(diagnostics[2], code=2072, marker=markers["@unusedContractVariable"])
 
     def test_publish_diagnostics_errors(self, solc: JsonRpcProcess) -> None:
         self.setup_lsp(solc)
@@ -979,130 +1129,38 @@ class SolidityLSPTestSuite: # {{{
 
     def test_generic(self, solc: JsonRpcProcess) -> None:
         self.setup_lsp(solc)
-        TESTS = ['goto_definition']
+
+
+        TESTS = ['goto_definition', 'publish_diagnostics_1']
 
         for test in TESTS:
             content = None
             markers = None
 
             testFails = True
-            parsedTestcases = None
-            expectedDiagnostics = None
+            print(f"Running {test}")
 
             while testFails:
+                runner = FileTestRunner(test, solc, self)
+
                 try:
-                    content = self.get_test_file_contents(test)
-                    markers = self.get_file_tags(test)
-                    parsedTestcases = TestParser(content).parse()
+                    if not runner.test_diagnostics():
+                        print("Diagnostics fails")
+                        continue
+                    result = runner.test_methods()
+                    print(f"method result: {result}")
+                    testFails = not result
 
-                    # Process diagnostics first
-                    expectedDiagnostics = next(parsedTestcases)
-                    assert isinstance(expectedDiagnostics, TestParser.Diagnostics) is True
-
-                    tests = expectedDiagnostics.tests
-
-                    if test not in tests:
-                        tests[test] = []
-
-                    published_diagnostics = \
-                        self.open_file_and_wait_for_diagnostics(solc, test, len(tests))
-                    self.expect_equal(
-                        len(published_diagnostics),
-                        len(tests),
-                        "Amount of reports does not match!")
-
-                    for diagnostics in published_diagnostics:
-                        testname = diagnostics["uri"].replace(self.project_root_uri + "/", "")[:-len(".sol")]
-
-                        expected_diagnostics = tests[testname]
-                        self.expect_equal(
-                            len(diagnostics["diagnostics"]),
-                            len(expected_diagnostics),
-                            "Unexpected amount of diagnostics"
-                        )
-                        lMarkers = self.get_file_tags(testname)
-                        for diagnostic in diagnostics["diagnostics"]:
-                            expected_diagnostic = next((x for x in
-                                expected_diagnostics if diagnostic['range'] ==
-                                lMarkers[x.marker]), None)
-
-                            if expected_diagnostic is None:
-                                raise ExpectationFailed(
-                                    f"Unexpected diagnostic: {json.dumps(diagnostic, indent=4, sort_keys=True)}")
-
-                            #import pdb; pdb.set_trace()
-                            self.expect_diagnostic(
-                                diagnostic,
-                                code=expected_diagnostic.code,
-                                marker=lMarkers[expected_diagnostic.marker]
-                            )
-
-                        testFails = False
                 except ExpectationFailed as e:
                     print(e)
-                    self.userInteractionFailedDiagnostics(solc, test, content, expectedDiagnostics.start, expectedDiagnostics.end)
+                    self.userInteractionFailedDiagnostics(
+                        solc,
+                        test,
+                        runner.content,
+                        runner.expected_diagnostics
+                    )
                     continue
 
-                try:
-                    # Now handle each request/response pair in the test definition
-                    for testcase in parsedTestcases:
-
-                        requestBodyJson = self.parse_json_with_tags(testcase.request, markers)
-                        # add textDocument/uri if missing
-                        if 'textDocument' not in requestBodyJson:
-                            requestBodyJson['textDocument'] = { 'uri': self.get_test_file_uri(test) }
-                        actualResponseJson = solc.call_method(testcase.method, requestBodyJson)
-
-                        #print(actualResponseJson)
-                        if "method" in actualResponseJson and \
-                            actualResponseJson["method"] == "textDocument/publishDiagnostics":
-
-                            print("Received more diagnostics than expected: \n" +
-                                json.dumps(actualResponseJson["params"], indent=4, sort_keys=True))
-                            self.userInteractionFailedDiagnostics(
-                                solc,
-                                test,
-                                content,
-                                expectedDiagnostics.start,
-                                expectedDiagnostics.end
-                            )
-                            break
-
-
-                        for result in actualResponseJson["result"]:
-                            result["uri"] = result["uri"].replace(self.project_root_uri + "/", "")
-
-                        try:
-                            expectedResponseJson = self.parse_json_with_tags(testcase.response, markers)
-                        except json.decoder.JSONDecodeError:
-                            expectedResponseJson = None
-
-
-                        if expectedResponseJson != actualResponseJson:
-                            print("Request failed: \n" + testcase.request)
-                            actualResponsePretty = self.replace_ranges_with_tags(actualResponseJson)
-
-                            if expectedResponseJson is None:
-                                print("Failed to parse expected response, received: \n" + actualResponsePretty)
-                            else:
-                                print("Expected:\n" + \
-                                    self.replace_ranges_with_tags(expectedResponseJson) + \
-                                    "\nbut got:\n" + actualResponsePretty
-                                )
-                            print("(u)pdate/(r)etry/(i)gnore?")
-                            userResponse = sys.stdin.read(1)
-                            if userResponse == "u":
-                                content = content[:testcase.responseBegin] + \
-                                    precedeComments("<- " + self.replace_ranges_with_tags(actualResponseJson)) + \
-                                    content[testcase.responseEnd:]
-
-                                with open(self.get_test_file_path(test), mode="w", encoding="utf-8", newline='') as f:
-                                    f.write(content)
-                    else:
-                        continue
-                except TestParserException as e:
-                    print(e)
-                    print(e.result)
 
 
     def test_textDocument_didChange_updates_diagnostics(self, solc: JsonRpcProcess) -> None:
