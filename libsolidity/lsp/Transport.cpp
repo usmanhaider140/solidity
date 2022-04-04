@@ -37,10 +37,6 @@
 using namespace std;
 using namespace solidity::lsp;
 
-#define lspDebug(msg) do { \
-	std::ofstream("/tmp/solc.log", std::ios_base::app) << (msg) << std::endl; \
-} while (0)
-
 // {{{ Transport
 optional<Json::Value> Transport::receive()
 {
@@ -87,7 +83,6 @@ optional<map<string, string>> Transport::parseHeaders()
 
 		auto const name = boost::to_lower_copy(line.substr(0, delimiterPos));
 		auto const value = line.substr(delimiterPos + 1);
-		lspDebug(fmt::format("parsed header [{}] = \"{}\"", name, value));
 		if (!headers.emplace(
 			boost::trim_copy(name),
 			boost::trim_copy(value)
@@ -188,7 +183,6 @@ std::string StdioTransport::readBytes(size_t _byteCount)
 	auto const n = fread(buffer.data(), 1, _byteCount, stdin);
 	if (n < _byteCount)
 		buffer.resize(n);
-	lspDebug(fmt::format("StdioTransport.readBytes({};{};{}): \"{}\"", _byteCount, n, buffer.size(), buffer));
 	return buffer;
 }
 
