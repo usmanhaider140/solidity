@@ -481,8 +481,9 @@ void OptimizedEVMCodeTransform::operator()(CFG::BasicBlock const& _block)
 		},
 		[&](CFG::BasicBlock::FunctionReturn const& _functionReturn)
 		{
-			yulAssert(m_currentFunctionInfo, "");
-			yulAssert(m_currentFunctionInfo == _functionReturn.info, "");
+			yulAssert(m_currentFunctionInfo);
+			yulAssert(m_currentFunctionInfo == _functionReturn.info);
+			yulAssert(m_currentFunctionInfo->canContinue);
 
 			// Construct the function return layout, which is fully determined by the function signature.
 			Stack exitStack = m_currentFunctionInfo->returnVariables | ranges::views::transform([](auto const& _varSlot){
@@ -494,7 +495,16 @@ void OptimizedEVMCodeTransform::operator()(CFG::BasicBlock const& _block)
 			createStackLayout(debugDataOf(_functionReturn), exitStack);
 			m_assembly.appendJump(0, AbstractAssembly::JumpType::OutOfFunction);
 		},
-		[&](CFG::BasicBlock::Terminated const&) { }
+		[&](CFG::BasicBlock::Terminated const&)
+		{
+			yulAssert(!_block.operations.empty());
+			if (CFG::BuiltinCall const* builtinCall = get_if<CFG::BuiltinCall>(&_block.operations.back().operation))
+				yulAssert(builtinCall->builtin.get().controlFlowSideEffects.terminatesOrReverts(), "");
+			else if (CFG::FunctionCall const* functionCall = get_if<CFG::FunctionCall>(&_block.operations.back().operation))
+				yulAssert(!functionCall->canContinue);
+			else
+				yulAssert(false);
+		}
 	}, _block.exit);
 	// TODO: We could assert that the last emitted assembly item terminated or was an (unconditional) jump.
 	//       But currently AbstractAssembly does not allow peeking at the last emitted assembly item.
