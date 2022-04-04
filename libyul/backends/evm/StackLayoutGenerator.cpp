@@ -767,28 +767,30 @@ void StackLayoutGenerator::fillInJunk(CFG::BasicBlock const& _block, CFG::Functi
 		createStackLayout(_source, _target, swap, dupOrPush, pop);
 		return opGas;
 	};
-
-	if (_functionInfo && !_functionInfo->canContinue && _block.allowsJunk())
-	{
-		// TODO: unify with the one below
-		Stack entryLayout;
-		for (auto const& param: _functionInfo->parameters | ranges::views::reverse)
-			entryLayout.emplace_back(param);
-		Stack nextLayout = m_layout.blockInfos.at(&_block).entryLayout;
-
-		size_t bestCost = evaluateTransform(entryLayout, nextLayout);
+	/// @returns the number of junk slots to be prepended to @a _targetLayout for an optimal transition from
+	/// @a _entryLayout to @a _targetLayout.
+	auto getBestNumJunk = [&](Stack const& _entryLayout, Stack const& _targetLayout) -> size_t {
+		size_t bestCost = evaluateTransform(_entryLayout, _targetLayout);
 		size_t bestNumJunk = 0;
-		size_t maxJunk = entryLayout.size();
+		size_t maxJunk = _entryLayout.size();
 		for (size_t numJunk = 1; numJunk <= maxJunk; ++numJunk)
 		{
-			size_t cost = evaluateTransform(entryLayout, Stack{numJunk, JunkSlot{}} + nextLayout);
+			size_t cost = evaluateTransform(_entryLayout, Stack{numJunk, JunkSlot{}} + _targetLayout);
 			if (cost < bestCost)
 			{
 				bestCost = cost;
 				bestNumJunk = numJunk;
 			}
 		}
+		return bestNumJunk;
+	};
 
+	if (_functionInfo && !_functionInfo->canContinue && _block.allowsJunk())
+	{
+		size_t bestNumJunk = getBestNumJunk(
+			_functionInfo->parameters | ranges::views::reverse | ranges::to<Stack>,
+			m_layout.blockInfos.at(&_block).entryLayout
+		);
 		if (bestNumJunk > 0)
 			addJunkRecursive(&_block, bestNumJunk);
 	}
@@ -801,21 +803,10 @@ void StackLayoutGenerator::fillInJunk(CFG::BasicBlock const& _block, CFG::Functi
 		{
 			auto& blockInfo = m_layout.blockInfos.at(_block);
 			Stack entryLayout = blockInfo.entryLayout;
-			Stack nextLayout = _block->operations.empty() ? blockInfo.exitLayout : m_layout.operationEntryLayout.at(&_block->operations.front());
-
-			size_t bestCost = evaluateTransform(entryLayout, nextLayout);
-			size_t bestNumJunk = 0;
-			size_t maxJunk = entryLayout.size();
-			for (size_t numJunk = 1; numJunk <= maxJunk; ++numJunk)
-			{
-				size_t cost = evaluateTransform(entryLayout, Stack{numJunk, JunkSlot{}} + nextLayout);
-				if (cost < bestCost)
-				{
-					bestCost = cost;
-					bestNumJunk = numJunk;
-				}
-			}
-
+			size_t bestNumJunk = getBestNumJunk(
+				entryLayout,
+				_block->operations.empty() ? blockInfo.exitLayout : m_layout.operationEntryLayout.at(&_block->operations.front())
+			);
 			if (bestNumJunk > 0)
 			{
 				addJunkRecursive(_block, bestNumJunk);
