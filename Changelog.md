@@ -6,6 +6,7 @@ Language Features:
 Compiler Features:
  * Peephole Optimizer: Remove operations without side effects before simple terminations.
  * Assembly-Json: Export: Include source list in `sourceList` field.
+ * Yul EVM Code Transform: Generate more optimal code for user-defined functions that always terminate a transaction.
 
 
 Bugfixes:
